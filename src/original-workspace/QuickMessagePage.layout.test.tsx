@@ -2,11 +2,12 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { QuickMessagePage } from "./QuickMessagePage";
-const request = vi.hoisted(() => vi.fn(async (r:{action:string}) => r.action === "feishuAuthStatus"
+const defaultRequest = vi.hoisted(() => async (r:{action:string}): Promise<any> => r.action === "feishuAuthStatus"
   ? {connected:true,message:"已连接"}
   : r.action === "feishuTaskList" ? {items:[],accountId:"ou_test",hasMore:false,nextPageToken:""}
   : r.action === "feishuCalendarList" ? {items:[]}
-  : {config:{feishuTools:true},feishuCatalog:{recipients:[],partial:true,lastSync:null}}));
+  : {config:{feishuTools:true},feishuCatalog:{recipients:[],partial:true,lastSync:null}});
+const request = vi.hoisted(() => vi.fn(defaultRequest));
 vi.mock("../experiments/client",()=>({experimentsRequest:request}));
 afterEach(()=>{cleanup();request.mockClear();});
 it("keeps all voice actions in the same workspace header and preserves the message recording API",async()=>{
@@ -95,4 +96,71 @@ it('refreshes on workspace changes without repeatedly checking an idle page',asy
   await act(async()=>{window.dispatchEvent(new Event('feishu-workspace-changed'));});
   expect(request.mock.calls.filter(([r])=>r.action==='read')).toHaveLength(2);
  }finally{cleanup();vi.useRealTimers();}
+});
+
+it('keeps workspace tabs interactive and offers one-click CLI retry when CLI auto-install failed', async () => {
+  request.mockImplementation(async (r: { action: string }) => {
+    if (r.action === 'feishuAuthStatus') {
+      return { connected: false, cliMissing: true, cliStatus: 'failed', message: '飞书运行组件安装失败' };
+    }
+    if (r.action === 'read') {
+      return {
+        config: { feishuTools: true },
+        feishuCatalog: { recipients: [], partial: true, lastSync: null },
+        cliRuntime: { installed: false, status: 'failed', error: '插件运行时下载超时，请检查网络后重试' },
+      };
+    }
+    if (r.action === 'feishuPluginCliInstall') {
+      return { installed: true, managed: true, version: '1.0.98' };
+    }
+    return { items: [] };
+  });
+  render(<QuickMessagePage />);
+  expect(await screen.findByText('飞书本地运行组件尚未就绪')).toBeTruthy();
+  expect(screen.getByRole('tab', { name: '消息' })).toBeTruthy();
+  expect(screen.getByRole('tab', { name: '设置' })).toBeTruthy();
+  expect(screen.queryByText(/本机组件未确认操作结果/)).toBeNull();
+
+  const header = screen.getByRole('region', { name: '飞书工作台' }).querySelector('.feishu-workspace-header') as HTMLElement;
+  fireEvent.click(within(header).getByRole('button', { name: '安装飞书组件' }));
+  expect(screen.getByRole('tab', { name: '设置' }).getAttribute('aria-selected')).toBe('true');
+
+  fireEvent.click(screen.getByRole('button', { name: '重试安装组件' }));
+  await waitFor(() => expect(request.mock.calls.some(([r]) => r.action === 'feishuPluginCliInstall')).toBe(true));
+});
+
+it('silently retries transient developer-mode verification (temporarily_unavailable) without flashing an alert', async () => {
+  const { act } = await import('@testing-library/react');
+  vi.useFakeTimers();
+  try {
+    let readCalls = 0;
+    request.mockImplementation(async (r: { action: string }) => {
+      if (r.action === 'feishuAuthStatus') {
+        return { connected: false, message: '未连接' };
+      }
+      if (r.action === 'read') {
+        readCalls += 1;
+        if (readCalls === 1) {
+          throw Object.assign(new Error('开发连接正在核验，请稍后重试'), { code: 'temporarily_unavailable' });
+        }
+        return { config: { feishuTools: true }, feishuCatalog: { recipients: [], partial: true, lastSync: null } };
+      }
+      return { items: [] };
+    });
+    render(<QuickMessagePage />);
+    await act(async () => {});
+    expect(readCalls).toBe(1);
+    expect(screen.queryByRole('alert')).toBeNull();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(900);
+    });
+    expect(readCalls).toBe(2);
+    expect(screen.getByRole('tab', { name: '消息' })).toBeTruthy();
+    expect(screen.queryByRole('alert')).toBeNull();
+  } finally {
+    cleanup();
+    vi.useRealTimers();
+    request.mockImplementation(defaultRequest);
+  }
 });

@@ -1,4 +1,4 @@
-import { feishu,getClient } from '../client';
+import { feishu,getClient,type CliRuntimeState } from '../client';
 import { completeWorkspaceTask,listWorkspaceCalendar,listWorkspaceTasks } from '../workspace-record-service';
 import type { FeishuMessageDraft, FeishuRecipient } from '../original-workspace/FeishuMessagePanel';
 
@@ -13,11 +13,11 @@ export type AiReply = {
 };
 export type FeishuCatalog = { searchQuery?:string; recipients:FeishuRecipient[];lastSync:number|null;partial:boolean };
 export type FeishuAuthorizationFlow = {stage?:"registration"|"authorization";verificationUrl:string;flowId:string;qrDataUrl?:string};
-export type FeishuAuthStatus = {pendingAuthorization?:FeishuAuthorizationFlow;connected:boolean;allPermissionsGranted?:boolean;taskConnected?:boolean;calendarConnected?:boolean;calendarMissingScopes?:string[];message:string};
+export type FeishuAuthStatus = {pendingAuthorization?:FeishuAuthorizationFlow;connected:boolean;cliMissing?:boolean;cliStatus?:'unknown'|'installing'|'ready'|'failed';cliError?:string;allPermissionsGranted?:boolean;taskConnected?:boolean;calendarConnected?:boolean;calendarMissingScopes?:string[];message:string};
 export type FeishuComparisonMetrics = {cases:number;correct:number;falseSelections:number;rejections:number;failures:number;sampleAccuracy:number|null;meanLatencyMs:number|null};
 export type FeishuComparisonReport = {executed:boolean;complete:boolean;caseCount:number;summary:{llm:FeishuComparisonMetrics;jev:FeishuComparisonMetrics};limitations:string[]};
 export type ExperimentsConfig = {feishuTools?:boolean;feishuRecipientModel?:'llm'|'jev';feishuMessageStyle?:string;pluginShortcuts?:{pluginId:string;purpose?:string;hotkey:string;trigger:string}[]};
-export type ExperimentsSnapshot = {config:ExperimentsConfig;recording?:{mode:string;status:string};feishuDraft?:FeishuMessageDraft|null;feishuCatalog?:FeishuCatalog;aiReply?:AiReply|null;aiReplies?:AiReply[]};
+export type ExperimentsSnapshot = {config:ExperimentsConfig;recording?:{mode:string;status:string};feishuDraft?:FeishuMessageDraft|null;feishuCatalog?:FeishuCatalog;aiReply?:AiReply|null;aiReplies?:AiReply[];cliRuntime?:CliRuntimeState};
 export type VoiceStatus={actionId:string|null;status:string};
 export type ExperimentsRequest = {action:string;[key:string]:unknown};
 

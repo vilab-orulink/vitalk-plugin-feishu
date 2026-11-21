@@ -2,6 +2,7 @@ import {prepareCalendar,type CalendarModel} from './calendar-intent';
 import {createCalendar,type CalendarReceipt} from './calendar-service';
 import type {CliAuthStatus} from './cli-auth';
 import {readEmployeeRoster,type RosterRequest} from './employee-roster';
+import {PreparationError} from './person-context';
 import type {Person} from './task-intent';
 import type {Cli} from './task-service';
 import {notifyCalendar} from './calendar-notification';
@@ -25,10 +26,11 @@ const grants = [
   ['calendar:calendar.free_busy:read','calendar:calendar:readonly','calendar:calendar'],
 ];
 
-function requireCalendarGrant(account: CliAuthStatus) {
-  if (!/^ou_[A-Za-z0-9_]{1,125}$/.test(account.accountId)) throw new Error('飞书账号未确认，请重新检查连接。');
+function requireCalendarGrant(account: CliAuthStatus, preMutation = true) {
+  const wrap = (message: string) => (preMutation ? new PreparationError(message) : new Error(message));
+  if (!/^ou_[A-Za-z0-9_]{1,125}$/.test(account.accountId)) throw wrap('飞书账号未确认，请重新检查连接。');
   if (grants.some(group => !group.some(scope => account.scopes.includes(scope)))) {
-    throw new Error('飞书缺少日历权限，请重新授权。');
+    throw wrap('飞书缺少日历权限，请重新授权。');
   }
 }
 
@@ -37,10 +39,13 @@ export async function runCalendarCreation(input: {source:string;operationId:stri
   const initial = await deps.readAccount();
   requireCalendarGrant(initial);
   const accountId = initial.accountId;
-  const verifyAccount = async () => {
+  const verifyAccount = async (preMutation = true) => {
     const current = await deps.readAccount();
-    requireCalendarGrant(current);
-    if (current.accountId !== accountId) throw new Error('飞书账号已切换，已停止日程操作。');
+    requireCalendarGrant(current, preMutation);
+    if (current.accountId !== accountId) {
+      const message = '飞书账号已切换，已停止日程操作。';
+      throw preMutation ? new PreparationError(message) : new Error(message);
+    }
     return current.accountId;
   };
 
@@ -53,16 +58,19 @@ export async function runCalendarCreation(input: {source:string;operationId:stri
   let participantIds = plan.participantIds;
   let rosterReadAt: number | undefined;
   if (plan.participantScope === 'allCurrentEmployees') {
-    const roster = await readEmployeeRoster({request:deps.rosterRequest,readAccount:verifyAccount});
+    const roster = await readEmployeeRoster({request:deps.rosterRequest,readAccount:()=>verifyAccount(true)}).catch(error => {
+      throw error instanceof PreparationError ? error : new PreparationError(error instanceof Error ? error.message : String(error));
+    });
     participantIds = roster.recipients.map(recipient => recipient.id);
     rosterReadAt = performance.now();
   }
   const receipt = await createCalendar(deps.cli,{...plan,participantIds},input.operationId,{
     beforeSubmit:async phase => {
-      await verifyAccount();
+      await verifyAccount(phase === 'create');
       await deps.beforeSubmit?.(phase);
       if (rosterReadAt !== undefined && performance.now() - rosterReadAt > 300_000) {
-        throw new Error('全公司员工名册已过期，请重新核验。');
+        const message = '全公司员工名册已过期，请重新核验。';
+        throw phase === 'create' ? new PreparationError(message) : new Error(message);
       }
     },
     onCreated:receipt=>deps.onCreated?.(receipt,{...plan,participantIds}),

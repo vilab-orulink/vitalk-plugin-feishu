@@ -1,3 +1,4 @@
+import {CliNotAuthenticatedError} from './cli-auth';
 import {PreparationError} from './person-context';
 type Attachment={id:string;dataUrl:string;width:number;height:number};
 type VoiceRequest={requestId:string;actionId:string;transcript:string;sessionId:string;attachments?:Attachment[]};
@@ -111,10 +112,13 @@ export function createReportedVoiceWorkflow(deps:Dependencies){
    const action=event.actionId==='message'?'消息':event.actionId==='task'?'任务':'日程';
    const stage=failure?labels[failure.stage]||'处理请求':'处理请求';
    const elapsed=(Math.round(performance.now()-started)/1000).toFixed(1);
+   if(error instanceof CliNotAuthenticatedError)return {title:`${action}处理失败`,text:`${stage}失败：请先在飞书插件中连接飞书账号后再使用。耗时 ${elapsed} 秒。本次请求未执行发送或创建。`};
    if(error instanceof PreparationError)return {title:`${action}处理失败`,text:`${stage}失败：${error.message}。耗时 ${elapsed} 秒。本次请求未执行发送或创建。`};
+   const missingCli=failure?.code==='dependency_not_installed'||failure?.causeCodes?.includes('dependency_not_installed')||(error&&typeof error==='object'&&'code' in error&&error.code==='dependency_not_installed');
+   if(missingCli)return {title:`${action}处理失败`,text:`${stage}失败：飞书运行组件尚未安装或正在后台准备，请稍候或打开飞书插件查看进度。耗时 ${elapsed} 秒。本次请求未执行发送或创建。`};
    const codes=[failure?.code,failure?.upstreamCode].filter(value=>value!==undefined);
    const detail=codes.length?`（${codes.join(' / ')}）`:'';
-   const dialogUnsent=failure?.stage==='message.confirm'&&['MESSAGE_NOTICE_FAILED','MESSAGE_NOTICE_INVALID_RECEIPT'].includes(failure.code||'');
+   const dialogUnsent=failure?.stage==='message.confirm'&&['MESSAGE_NOTICE_FAILED','MESSAGE_NOTICE_INVALID_RECEIPT','message_not_submitted','NOT_SUBMITTED'].includes(failure.code||'');
    const uncertain=!failure||!['message.prepare','message.open'].includes(failure.stage);
    return {title:`${action}处理失败`,text:`${stage}失败${detail}，耗时 ${elapsed} 秒。${dialogUnsent?'消息尚未发送，草稿已保留，请重新打开确认窗口。':uncertain?'操作结果尚未确认，请先在飞书核对，避免重复提交。':'本次请求未执行发送或创建。'}`};
   }

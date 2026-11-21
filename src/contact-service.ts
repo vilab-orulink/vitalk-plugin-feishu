@@ -1,3 +1,4 @@
+import {PreparationError} from './person-context';
 import type {Person} from './task-intent';
 import type {Cli} from './task-service';
 export type ContactCatalog={people:Person[];chats:{id:string;name:string;kind:'chat';active:boolean;external:boolean}[];scope:'visible';companyComplete:false;unverifiedIds:string[]};
@@ -105,8 +106,8 @@ async function qualify(cli:Cli,candidates:Row[],operationId:string,options:Optio
  for(let start=0;start<unknown.length;start+=30) {
   const batch=unknown.slice(start,start+30);let response:Row;
   try {response=data(await cli(['contact','+search-user','--user-ids',batch.join(','),'--left-organization','--page-size','30',...suffix],operationId));}
-  catch {throw new Error('无法核验联系人在职状态，请检查连接或补充通讯录权限后刷新');}
-  if(response.has_more!==false||!Array.isArray(response.users))throw new Error('联系人在职状态核验不完整，请刷新后重试');
+  catch {throw new PreparationError('无法核验联系人在职状态，请检查连接或补充通讯录权限后刷新');}
+  if(response.has_more!==false||!Array.isArray(response.users))throw new PreparationError('联系人在职状态核验不完整，请刷新后重试');
   for(const value of response.users) {const member=row(value);if(!member||!id(member.open_id))throw new Error('联系人在职状态格式无效');if(batch.includes(member.open_id))excluded.add(member.open_id);}
   for(const member of batch)departureChecked.add(member);
  }
@@ -123,11 +124,11 @@ async function qualify(cli:Cli,candidates:Row[],operationId:string,options:Optio
  return {people:result,unverifiedIds:result.filter(person=>!person.active||person.external).map(person=>person.id)};
 }
 export async function searchContacts(cli:Cli,query:string,operationId:string,options:Options={}):Promise<ContactCatalog> {
- operation(operationId);if(!query.trim()||[...query].length>50||query.includes('\0'))throw new Error('请输入1到50字的联系人姓名');
+ operation(operationId);if(!query.trim()||[...query].length>50||query.includes('\0'))throw new PreparationError('请输入1到50字的联系人姓名');
  // v1.0.98 returns has_more but exposes no continuation flag for this shortcut.
  const response=data(await cli(['contact','+search-user','--query',query,'--page-size','30','--exclude-external-users',...suffix],operationId));
  if(typeof response.has_more!=='boolean'||!Array.isArray(response.users))throw new Error('联系人查询响应无效');
- if(response.has_more)throw new Error('联系人查询结果过多，请补充更具体的姓名以缩小范围');
+ if(response.has_more)throw new PreparationError('联系人查询结果过多，请补充更具体的姓名以缩小范围');
  const candidates=response.users.map(value=>{
   const candidate=row(value);
   if(!candidate)throw new Error('联系人记录格式无效');

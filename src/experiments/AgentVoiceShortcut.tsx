@@ -1,27 +1,45 @@
-import { useEffect, useRef, useState } from "react";
-import { Keyboard } from "lucide-react";
+import { useCallback, useEffect, useRef, useState, type FocusEvent } from "react";
 import { Button } from "@/components/ui/button";
+import {
+  buildModifierPreviewHotkey,
+  buildPluginHotkeyFromKeyboardEvent,
+  detectHotkeyPlatform,
+  formatHotkeyParts,
+  isModifierKey,
+} from "../lib/hotkeys";
 import { experimentsRequest, type ExperimentsConfig } from "./client";
 import "./agent-voice-shortcut.css";
 
 type Purpose = "message" | "task" | "calendar";
 type Phase = "idle" | "starting" | "listening" | "saving" | "restoring";
-const actions: [Purpose, string][] = [
-  ["message", "消息"],
-  ["task", "任务"],
-  ["calendar", "日程"],
+
+const HOTKEY_CAPTURE_SETTLE_MS = 160;
+const HOTKEY_CAPTURE_WATCHDOG_MS = 15_000;
+
+const actions: { purpose: Purpose; label: string; description: string }[] = [
+  {
+    purpose: "message",
+    label: "消息",
+    description: "按一次开始，再按一次结束；生成草稿后确认发送。",
+  },
+  {
+    purpose: "task",
+    label: "任务",
+    description: "按一次开始，再按一次结束；按指令创建或处理任务。",
+  },
+  {
+    purpose: "calendar",
+    label: "日程",
+    description: "按一次开始，再按一次结束；按指令创建或处理日程。",
+  },
 ];
-const suggestedHotkeys: Record<Purpose, string> = {
-  message: "Ctrl+Alt+F6",
-  task: "Ctrl+Alt+F7",
-  calendar: "Ctrl+Alt+F8",
-};
 
 // The native protocol pauses capture with a boolean. Serialize transitions and
 // track the owner so a late cleanup cannot resume shortcuts in a newer capture.
 let nativeTransition: Promise<unknown> = Promise.resolve();
 let queuedTransitions = 0;
 let captureOwner: symbol | undefined;
+
 function transition<T>(work: () => Promise<T>): Promise<T> {
   // Start an idle release synchronously: pagehide disposes the SDK immediately
   // after React cleanup, so deferring the send to a microtask can drop it.
@@ -44,6 +62,7 @@ function transition<T>(work: () => Promise<T>): Promise<T> {
   );
   return result;
 }
+
 function acquireCapture() {
   const owner = Symbol("shortcut capture");
   let cancelled = false;
@@ -73,6 +92,7 @@ function acquireCapture() {
     },
   };
 }
+
 type Capture = ReturnType<typeof acquireCapture>;
 const messageOf = (error: unknown) =>
   error instanceof Error ? error.message : String(error);
@@ -81,25 +101,18 @@ export function shortcutFromKey(
   event: Pick<
     KeyboardEvent,
     "ctrlKey" | "metaKey" | "altKey" | "shiftKey" | "code"
-  >,
+  > & { key?: string },
 ) {
-  const keys: string[] = [];
-  if (event.ctrlKey) keys.push("Ctrl");
-  if (event.metaKey) keys.push("Super");
-  if (event.altKey) keys.push("Alt");
-  if (event.shiftKey) keys.push("Shift");
-  const key =
-    event.code === "Space"
-      ? "Space"
-      : event.code.startsWith("Key")
-        ? event.code.slice(3)
-        : event.code.startsWith("Digit")
-          ? event.code.slice(5)
-          : /^F([1-9]|1[0-2])$/.test(event.code)
-            ? event.code
-            : "";
-  return key && keys.length ? [...keys, key].join("+") : "";
+  return buildPluginHotkeyFromKeyboardEvent({
+    ctrlKey: event.ctrlKey,
+    metaKey: event.metaKey,
+    altKey: event.altKey,
+    shiftKey: event.shiftKey,
+    code: event.code,
+    key: event.key ?? "",
+  });
 }
+
 export function AgentVoiceShortcut({
   config,
   enabled,
@@ -111,14 +124,18 @@ export function AgentVoiceShortcut({
   onToggleEnabled: () => void;
   onSaved?: () => void;
 }) {
+  const platform = detectHotkeyPlatform();
   const [listening, setListening] = useState<Purpose | null>(null);
   const [phase, setPhase] = useState<Phase>("idle");
+  const [previewHotkey, setPreviewHotkey] = useState<string | null>(null);
   const [error, setError] = useState("");
+  const [errorPurpose, setErrorPurpose] = useState<Purpose | null>(null);
   const [feedback, setFeedback] = useState("");
   const [recovery, setRecovery] = useState(false);
   const [confirmed, setConfirmed] = useState<Partial<Record<Purpose, string>>>(
     {},
   );
+
   const mounted = useRef(true);
   const version = useRef(0);
   const pending = useRef(false);
@@ -126,19 +143,50 @@ export function AgentVoiceShortcut({
   const buttons = useRef<Partial<Record<Purpose, HTMLButtonElement | null>>>(
     {},
   );
+  const pressedKeysRef = useRef<Set<string>>(new Set());
+  const recentlyReleasedModifierKeysRef = useRef<Set<string>>(new Set());
+  const pendingHotkeyRef = useRef<string | null>(null);
+  const settleTimerRef = useRef<number | null>(null);
+  const watchdogTimerRef = useRef<number | null>(null);
+  const listeningRef = useRef<Purpose | null>(null);
+  const phaseRef = useRef<Phase>("idle");
+  listeningRef.current = listening;
+  phaseRef.current = phase;
+
   const current = (value: number) =>
     mounted.current && version.current === value;
+
   const savedKey = (purpose: Purpose) =>
     config.pluginShortcuts?.find(
       (item) =>
         item.pluginId === "vitalk-plugin-feishu" &&
         (item.purpose || "message") === purpose,
     )?.hotkey ?? "";
+
+  const clearTimers = useCallback(() => {
+    if (settleTimerRef.current !== null) {
+      window.clearTimeout(settleTimerRef.current);
+      settleTimerRef.current = null;
+    }
+    if (watchdogTimerRef.current !== null) {
+      window.clearTimeout(watchdogTimerRef.current);
+      watchdogTimerRef.current = null;
+    }
+  }, []);
+
+  const resetChordState = useCallback(() => {
+    clearTimers();
+    pressedKeysRef.current.clear();
+    recentlyReleasedModifierKeysRef.current.clear();
+    pendingHotkeyRef.current = null;
+    setPreviewHotkey(null);
+  }, [clearTimers]);
+
   useEffect(() => {
     setConfirmed((previous) => {
       const next = { ...previous };
       let changed = false;
-      for (const [purpose] of actions)
+      for (const { purpose } of actions)
         if (
           next[purpose] !== undefined &&
           next[purpose] === savedKey(purpose)
@@ -149,41 +197,82 @@ export function AgentVoiceShortcut({
       return changed ? next : previous;
     });
   }, [config.pluginShortcuts]);
+
   useEffect(() => {
     mounted.current = true;
     return () => {
       mounted.current = false;
       version.current++;
+      clearTimers();
       // release queues behind an in-flight acquisition, including a late ACK.
       void lease.current?.release().catch(() => undefined);
     };
-  }, []);
-  async function restore(capture: Capture | null, operation: number) {
-    if (!capture) return true;
-    try {
-      await capture.release();
-      if (lease.current === capture) lease.current = null;
-      if (current(operation)) setRecovery(false);
-      return true;
-    } catch (failure) {
-      if (current(operation)) {
-        setRecovery(true);
-        setError(
-          (previous) =>
-            `${previous ? previous + "；" : ""}快捷键监听恢复失败：${messageOf(failure)}`,
-        );
+  }, [clearTimers]);
+
+  const restore = useCallback(
+    async (capture: Capture | null, operation: number, targetPurpose: Purpose | null) => {
+      if (!capture) return true;
+      try {
+        await capture.release();
+        if (lease.current === capture) lease.current = null;
+        if (current(operation)) setRecovery(false);
+        return true;
+      } catch (failure) {
+        if (current(operation)) {
+          setRecovery(true);
+          if (targetPurpose) setErrorPurpose(targetPurpose);
+          setError(
+            (previous) =>
+              `${previous ? previous + "；" : ""}快捷键监听恢复失败：${messageOf(failure)}`,
+          );
+        }
+        return false;
       }
-      return false;
-    }
-  }
-  async function begin(purpose: Purpose) {
-    if (pending.current || listening || recovery) return;
+    },
+    [],
+  );
+
+  const cancel = useCallback(async () => {
+    const activePhase = phaseRef.current;
+    if (activePhase === "saving" || activePhase === "restoring") return;
+    const purpose = listeningRef.current;
+    const recovering = recovery;
     const operation = ++version.current;
     pending.current = true;
+    resetChordState();
+    setPhase("restoring");
+    setListening(null);
+    setFeedback("");
+    const restored = await restore(lease.current, operation, purpose);
+    if (current(operation)) {
+      pending.current = false;
+      setPhase("idle");
+      if (restored) {
+        if (recovering) {
+          setError("");
+          setErrorPurpose(null);
+        }
+        setFeedback(
+          recovering ? "快捷键监听已恢复。" : "已取消，原快捷键保持不变。",
+        );
+      }
+    }
+  }, [recovery, resetChordState, restore]);
+
+  async function begin(purpose: Purpose) {
+    if (pending.current || listening || recovery) return;
+    buttons.current[purpose]?.focus();
+    const operation = ++version.current;
+    pending.current = true;
+    resetChordState();
     setPhase("starting");
     setListening(purpose);
     setError("");
+    setErrorPurpose(null);
     setFeedback("");
+    watchdogTimerRef.current = window.setTimeout(() => {
+      if (current(operation)) void cancel();
+    }, HOTKEY_CAPTURE_WATCHDOG_MS);
     const capture = acquireCapture();
     lease.current = capture;
     try {
@@ -196,93 +285,251 @@ export function AgentVoiceShortcut({
       setPhase("listening");
       buttons.current[purpose]?.focus();
     } catch (failure) {
-      if (current(operation)) setError(messageOf(failure));
-      await restore(capture, operation);
       if (current(operation)) {
+        setErrorPurpose(purpose);
+        setError(messageOf(failure));
+      }
+      await restore(capture, operation, purpose);
+      if (current(operation)) {
+        clearTimers();
         pending.current = false;
         setPhase("idle");
         setListening(null);
       }
     }
   }
-  async function cancel() {
-    if (phase === "saving" || phase === "restoring") return;
-    const purpose = listening;
-    const recovering = recovery;
-    const operation = ++version.current;
-    pending.current = true;
-    setPhase("restoring");
-    setListening(null);
-    setFeedback("");
-    const restored = await restore(lease.current, operation);
-    if (current(operation)) {
-      pending.current = false;
-      setPhase("idle");
-      if (restored) {
-        if (recovering) setError("");
-        setFeedback(
-          recovering ? "快捷键监听已恢复。" : "已取消，原快捷键保持不变。",
-        );
-      }
-      if (purpose) buttons.current[purpose]?.focus();
-    }
-  }
-  async function save(purpose: Purpose, hotkey: string) {
-    if (pending.current || recovery) return;
-    const operation = ++version.current;
-    pending.current = true;
-    setPhase("saving");
-    setError("");
-    setFeedback("");
-    const capture = lease.current;
-    let saved = false;
-    try {
-      await experimentsRequest({
-        action: "feishuShortcutSet",
-        purpose,
-        hotkey,
-      });
-      saved = true;
-      if (current(operation))
-        setConfirmed((previous) => ({ ...previous, [purpose]: hotkey }));
-    } catch (failure) {
-      if (current(operation)) setError(messageOf(failure));
-    } finally {
-      await restore(capture, operation);
-      if (current(operation)) {
-        pending.current = false;
-        setPhase("idle");
-        setListening(null);
-        if (saved) {
-          setFeedback(hotkey ? "快捷键已保存。" : "快捷键已清除。");
-          onSaved?.();
+
+  const save = useCallback(
+    async (purpose: Purpose, hotkey: string) => {
+      if (pending.current || recovery) return;
+      const operation = ++version.current;
+      pending.current = true;
+      resetChordState();
+      setPhase("saving");
+      setError("");
+      setErrorPurpose(null);
+      setFeedback("");
+      const capture = lease.current;
+      let saved = false;
+      try {
+        await experimentsRequest({
+          action: "feishuShortcutSet",
+          purpose,
+          hotkey,
+        });
+        saved = true;
+        if (current(operation))
+          setConfirmed((previous) => ({ ...previous, [purpose]: hotkey }));
+      } catch (failure) {
+        if (current(operation)) {
+          setErrorPurpose(purpose);
+          setError(messageOf(failure));
         }
-        buttons.current[purpose]?.focus();
+      } finally {
+        await restore(capture, operation, purpose);
+        if (current(operation)) {
+          pending.current = false;
+          setPhase("idle");
+          setListening(null);
+          if (saved) {
+            setFeedback(hotkey ? "快捷键已保存。" : "快捷键已清除。");
+            onSaved?.();
+          }
+          buttons.current[purpose]?.focus();
+        }
       }
-    }
-  }
+    },
+    [onSaved, recovery, resetChordState, restore],
+  );
+
+  const pressedKeysContain = (keys: string[]) =>
+    keys.some(
+      (key) =>
+        pressedKeysRef.current.has(key) ||
+        recentlyReleasedModifierKeysRef.current.has(key),
+    );
+
+  const withTrackedModifiers = (
+    event: Pick<
+      KeyboardEvent,
+      "altKey" | "code" | "ctrlKey" | "key" | "metaKey" | "shiftKey"
+    >,
+  ) => ({
+    altKey:
+      event.altKey || pressedKeysContain(["Alt", "AltLeft", "AltRight", "Option"]),
+    ctrlKey:
+      event.ctrlKey ||
+      pressedKeysContain(["Control", "ControlLeft", "ControlRight", "Ctrl"]),
+    metaKey:
+      event.metaKey ||
+      pressedKeysContain(["Meta", "MetaLeft", "MetaRight", "OS", "Super"]),
+    shiftKey:
+      event.shiftKey || pressedKeysContain(["Shift", "ShiftLeft", "ShiftRight"]),
+    code: event.code,
+    key: event.key,
+  });
+
   useEffect(() => {
     if (!listening) return;
-    const handle = (event: KeyboardEvent) => {
+    const handleKeyDown = (event: KeyboardEvent) => {
       event.preventDefault();
       event.stopPropagation();
       if (event.repeat) return;
-      if (event.key === "Escape") {
+      if (
+        event.key === "Escape" ||
+        event.key === "Esc" ||
+        event.code === "Escape"
+      ) {
         void cancel();
         return;
       }
-      if (pending.current) return;
-      if (event.key === "Backspace") {
+      if (pending.current || phaseRef.current !== "listening") return;
+      if (settleTimerRef.current !== null) {
+        window.clearTimeout(settleTimerRef.current);
+        settleTimerRef.current = null;
+      }
+      setError("");
+      setErrorPurpose(null);
+
+      if (
+        !event.ctrlKey &&
+        !event.altKey &&
+        !event.metaKey &&
+        !event.shiftKey &&
+        (event.key === "Backspace" || event.key === "Delete")
+      ) {
         void save(listening, "");
         return;
       }
-      const value = shortcutFromKey(event);
-      if (value) void save(listening, value);
+
+      const keyId = event.code || event.key;
+      if (keyId) pressedKeysRef.current.add(keyId);
+      const tracked = withTrackedModifiers(event);
+      const candidate = buildPluginHotkeyFromKeyboardEvent(tracked, platform);
+      if (candidate) {
+        pendingHotkeyRef.current = candidate;
+        setPreviewHotkey(candidate);
+        return;
+      }
+      const modifierSet = new Set(pressedKeysRef.current);
+      if (tracked.ctrlKey) modifierSet.add("Ctrl");
+      if (tracked.altKey) modifierSet.add("Alt");
+      if (tracked.shiftKey) modifierSet.add("Shift");
+      if (tracked.metaKey) modifierSet.add("Super");
+      setPreviewHotkey(buildModifierPreviewHotkey(modifierSet, platform));
     };
-    window.addEventListener("keydown", handle, true);
-    return () => window.removeEventListener("keydown", handle, true);
-  }, [listening, phase]);
+
+    const handleKeyUp = (event: KeyboardEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (
+        event.key === "Escape" ||
+        event.key === "Esc" ||
+        event.code === "Escape"
+      ) {
+        void cancel();
+        return;
+      }
+      if (pending.current || phaseRef.current !== "listening") return;
+      if (settleTimerRef.current !== null) {
+        window.clearTimeout(settleTimerRef.current);
+        settleTimerRef.current = null;
+      }
+      const releasedId = event.code || event.key;
+      if (releasedId && isModifierKey(event)) {
+        recentlyReleasedModifierKeysRef.current.add(releasedId);
+      }
+      if (releasedId) pressedKeysRef.current.delete(releasedId);
+
+      if (!pendingHotkeyRef.current) {
+        const recovered = buildPluginHotkeyFromKeyboardEvent(
+          withTrackedModifiers({
+            altKey: false,
+            ctrlKey: false,
+            metaKey: false,
+            shiftKey: false,
+            code: event.code,
+            key: event.key,
+          }),
+          platform,
+        );
+        if (recovered) {
+          pendingHotkeyRef.current = recovered;
+          setPreviewHotkey(recovered);
+        }
+      }
+
+      if (pressedKeysRef.current.size > 0) return;
+
+      const hotkey = pendingHotkeyRef.current;
+      if (hotkey) {
+        pendingHotkeyRef.current = null;
+        void save(listening, hotkey);
+        return;
+      }
+
+      const activePurpose = listening;
+      settleTimerRef.current = window.setTimeout(() => {
+        settleTimerRef.current = null;
+        if (!mounted.current || listeningRef.current !== activePurpose) return;
+        recentlyReleasedModifierKeysRef.current.clear();
+        setPreviewHotkey(null);
+        setErrorPurpose(activePurpose);
+        setError("没有捕获到完整的组合键，请包含修饰键（如 Ctrl+U）后重试");
+      }, HOTKEY_CAPTURE_SETTLE_MS);
+    };
+
+    const handleWindowBlur = () => {
+      if (phaseRef.current === "starting" || phaseRef.current === "listening") {
+        void cancel();
+      }
+    };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "hidden") handleWindowBlur();
+    };
+
+    window.addEventListener("keydown", handleKeyDown, true);
+    window.addEventListener("keyup", handleKeyUp, true);
+    window.addEventListener("blur", handleWindowBlur);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown, true);
+      window.removeEventListener("keyup", handleKeyUp, true);
+      window.removeEventListener("blur", handleWindowBlur);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [cancel, listening, platform, save]);
+
+  useEffect(() => {
+    if (!recovery) return;
+    const tryRecover = () => {
+      if (!pending.current && phaseRef.current === "idle" && lease.current) {
+        void cancel();
+      }
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") tryRecover();
+    };
+    window.addEventListener("focus", tryRecover);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.removeEventListener("focus", tryRecover);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [cancel, recovery]);
+
   const busy = phase !== "idle" && phase !== "listening";
+  const handleShellBlur = (
+    purpose: Purpose,
+    event: FocusEvent<HTMLDivElement>,
+  ) => {
+    if (listening !== purpose) return;
+    if (phase !== "starting" && phase !== "listening") return;
+    const nextTarget = event.relatedTarget as Node | null;
+    if (nextTarget && event.currentTarget.contains(nextTarget)) return;
+    void cancel();
+  };
+
   return (
     <div className="feishu-shortcut-settings">
       <div className="feishu-shortcut-settings-header">
@@ -301,90 +548,117 @@ export function AgentVoiceShortcut({
         </Button>
       </div>
       <div className="feishu-shortcut-settings-list">
-        {actions.map(([purpose, label]) => {
+        {actions.map(({ purpose, label, description }) => {
           const hotkey = confirmed[purpose] ?? savedKey(purpose);
+          const isCurrent = listening === purpose;
+          const rowError = errorPurpose === purpose ? error : "";
+          const displayHotkey = isCurrent ? (previewHotkey ?? "") : hotkey;
+          const hotkeyParts = displayHotkey
+            ? formatHotkeyParts(displayHotkey, platform)
+            : [];
+          const placeholder = isCurrent
+            ? phase === "starting"
+              ? "正在准备…"
+              : phase === "saving"
+                ? "正在保存…"
+                : "按下组合键"
+            : "点击后直接按下你想要的快捷键";
+          const rowStatus = isCurrent
+            ? phase === "starting"
+              ? "正在准备快捷键监听…"
+              : phase === "saving"
+                ? "正在保存…"
+                : "正在监听快捷键...（按 Esc 取消，Backspace 清空）"
+            : "";
+
           return (
             <div className="feishu-shortcut-settings-row" key={purpose}>
-              <span>{label}</span>
-              <Button
-                ref={(node) => {
-                  buttons.current[purpose] = node;
-                }}
-                variant="outline"
-                size="sm"
-                aria-label={`${label} 唤醒快捷键`}
-                aria-pressed={listening === purpose}
-                disabled={
-                  busy || recovery || (!!listening && listening !== purpose)
-                }
-                onClick={() => void begin(purpose)}
+              <div className="feishu-shortcut-row-copy">
+                <span className="feishu-shortcut-row-title">{label}</span>
+                <p className="feishu-shortcut-row-desc">{description}</p>
+              </div>
+              <div
+                className="settings-hotkey-compact"
+                onBlur={(event) => handleShellBlur(purpose, event)}
               >
-                <Keyboard size={14} aria-hidden="true" />
-                {listening === purpose ? (
-                  phase === "saving" ? (
-                    "正在保存…"
-                  ) : phase === "starting" ? (
-                    "正在准备…"
-                  ) : (
-                    "按下组合键"
-                  )
-                ) : hotkey ? (
-                  <kbd>{hotkey}</kbd>
-                ) : (
-                  "设置快捷键"
-                )}
-              </Button>
-              {hotkey && (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  disabled={busy || !!listening || recovery}
-                  aria-label={`清除${label}快捷键`}
-                  onClick={() => void save(purpose, "")}
+                <div
+                  className={`settings-hotkey-compact-shell${isCurrent ? " is-listening" : ""}${rowError ? " has-error" : ""}`}
                 >
-                  清除
-                </Button>
-              )}
+                  <button
+                    ref={(node) => {
+                      buttons.current[purpose] = node;
+                    }}
+                    type="button"
+                    className="settings-hotkey-compact-trigger"
+                    aria-label={`${label} 唤醒快捷键`}
+                    aria-pressed={isCurrent}
+                    disabled={
+                      recovery ||
+                      (!!listening && !isCurrent) ||
+                      (busy && !isCurrent)
+                    }
+                    title={
+                      isCurrent
+                        ? "正在监听快捷键...（按 Esc 取消，Backspace 清空）"
+                        : "点击后直接按下你想要的快捷键"
+                    }
+                    onClick={() => void begin(purpose)}
+                  >
+                    {hotkeyParts.length > 0 ? (
+                      hotkeyParts.map((part, index) => (
+                        <span
+                          className="settings-hotkey-compact-chip"
+                          key={`${part}-${index}`}
+                        >
+                          {part}
+                        </span>
+                      ))
+                    ) : (
+                      <span className="settings-hotkey-compact-placeholder">
+                        {placeholder}
+                      </span>
+                    )}
+                    {!isCurrent && (
+                      <span
+                        className="settings-hotkey-edit-label"
+                        aria-hidden="true"
+                      >
+                        修改
+                      </span>
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    className="settings-hotkey-compact-clear"
+                    aria-label={`清除${label}快捷键`}
+                    disabled={
+                      busy ||
+                      recovery ||
+                      (!!listening && !isCurrent) ||
+                      (!hotkey && !isCurrent)
+                    }
+                    onMouseDown={(event) => event.preventDefault()}
+                    onClick={() => {
+                      if (isCurrent || !listening) void save(purpose, "");
+                    }}
+                  />
+                </div>
+                {(rowError || rowStatus) && (
+                  <div
+                    role={rowError ? "alert" : "status"}
+                    aria-live="polite"
+                    className={`settings-hotkey-compact-status${rowError ? " has-error" : ""}`}
+                  >
+                    {rowError || rowStatus}
+                  </div>
+                )}
+              </div>
             </div>
           );
         })}
       </div>
-      {listening && (
-        <div className="feishu-shortcut-capture">
-          <p role="status">
-            {phase === "starting"
-              ? "正在准备快捷键监听…"
-              : phase === "saving"
-                ? "正在保存快捷键…"
-                : "按下组合键 · Esc 取消"}
-          </p>
-          <div>
-            <Button
-              variant="outline"
-              size="sm"
-              aria-label="取消设置快捷键"
-              disabled={phase === "saving"}
-              onClick={() => void cancel()}
-            >
-              取消
-            </Button>
-            {phase === "listening" && (
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() =>
-                  void save(listening, suggestedHotkeys[listening])
-                }
-              >
-                使用 <kbd>{suggestedHotkeys[listening]}</kbd>
-              </Button>
-            )}
-          </div>
-          <small>按 Backspace 清除当前快捷键。</small>
-        </div>
-      )}
       {phase === "restoring" && <p role="status">正在恢复快捷键监听…</p>}
-      {error && <p role="alert">{error}</p>}
+      {error && !errorPurpose && <p role="alert">{error}</p>}
       {recovery && (
         <Button
           variant="outline"

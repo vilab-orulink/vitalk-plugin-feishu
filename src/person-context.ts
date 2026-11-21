@@ -2,7 +2,8 @@ import type {Person} from './task-intent';
 export type PersonAlias={query:string;recipientId:string};
 export const ALL_CONTACTS_ID='all-contacts';
 const selfWords=['我','自己','本人','我自己','我本人'];
-export class PreparationError extends Error{readonly code='NOT_SUBMITTED';}
+export class PreparationError extends Error{readonly code:string='NOT_SUBMITTED';}
+export class MessageNotSubmittedError extends PreparationError{override readonly code:string='message_not_submitted';}
 export function personContext(people:readonly Person[],accountId:string,aliases:readonly PersonAlias[],includeMissingSelf=true):Person[]{
  const result=people.map(person=>({...person,aliases:[...new Set([...(person.aliases??[]),...aliases.filter(a=>a.recipientId===person.id).map(a=>a.query.trim()).filter(a=>a.length>0&&a.length<=50),...(person.id===accountId?selfWords:[])].filter(alias=>person.id===accountId||!selfWords.includes(alias)))]}));
  if(/^ou_[A-Za-z0-9_]+$/.test(accountId)){

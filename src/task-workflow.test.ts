@@ -1,4 +1,5 @@
 import {expect,it,vi} from 'vitest';
+import {PreparationError} from './person-context';
 import {runTaskCreation} from './task-workflow';
 const people=[{id:'ou_ice',name:'阳晓冰',aliases:['小冰'],active:true,external:false}];
 const plan={action:'create',assigneeId:'ou_ice',summary:'带电脑来找我',description:'',due:null};
@@ -18,17 +19,18 @@ it('runs natural-language interpretation and one direct creation under the same 
 });
 it('does not execute when account changes during model processing',async()=>{
   const deps=fixture();deps.readAccount.mockResolvedValueOnce({accountId:'ou_self',scopes:['task:task:write']}).mockResolvedValueOnce({accountId:'ou_other',scopes:['task:task:write']});
-  await expect(runTaskCreation(input,deps)).rejects.toThrow('账号');expect(deps.cli).not.toHaveBeenCalled();
+  await expect(runTaskCreation(input,deps)).rejects.toBeInstanceOf(PreparationError);expect(deps.cli).not.toHaveBeenCalled();
 });
 it.each([0,1])('checks task permission before and after model processing (%s)',async index=>{
   const deps=fixture();
   if(index)deps.readAccount.mockResolvedValueOnce({accountId:'ou_self',scopes:['task:task:write']});
   deps.readAccount.mockResolvedValue({accountId:'ou_self',scopes:[]});
-  await expect(runTaskCreation(input,deps)).rejects.toThrow('重新授权');expect(deps.cli).not.toHaveBeenCalled();
+  await expect(runTaskCreation(input,deps)).rejects.toBeInstanceOf(PreparationError);expect(deps.cli).not.toHaveBeenCalled();
 });
 it('preserves uncertain execution without a second creation',async()=>{
   const deps=fixture();deps.cli.mockRejectedValue(new Error('结果未知'));
-  await expect(runTaskCreation(input,deps)).rejects.toThrow('结果未知');expect(deps.cli).toHaveBeenCalledTimes(1);
+  const err=await runTaskCreation(input,deps).catch(e=>e);
+  expect(err).toBeInstanceOf(Error);expect(err).not.toBeInstanceOf(PreparationError);expect(deps.cli).toHaveBeenCalledTimes(1);
 });
 
 it('retains confirmed task if receipt persistence fails and never sends notification',async()=>{

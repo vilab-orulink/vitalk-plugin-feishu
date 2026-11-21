@@ -1,4 +1,5 @@
 import type {CliAuthStatus} from './cli-auth';
+import {PreparationError} from './person-context';
 import {prepareTask,type Person,type TaskPlan} from './task-intent';
 import {createTask,type Cli} from './task-service';
 import {notifyTask} from './task-notification';
@@ -14,13 +15,13 @@ type Dependencies={
   verifyAllContacts?:()=>void|Promise<void>;
 };
 function requireTaskGrant(account:CliAuthStatus){
-  if(!/^ou_[A-Za-z0-9_-]+$/.test(account.accountId))throw new Error('飞书账号未确认，请重新检查连接。');
-  if(!account.scopes.includes('task:task:write'))throw new Error('飞书缺少任务权限，请重新授权。');
+  if(!/^ou_[A-Za-z0-9_-]+$/.test(account.accountId))throw new PreparationError('飞书账号未确认，请重新检查连接。');
+  if(!account.scopes.includes('task:task:write'))throw new PreparationError('飞书缺少任务权限，请重新授权。');
 }
 /** Fresh CLI identity reads bracket model work. A confirmed creation is kept even
  * when saving its receipt or sending the subsequent share card fails. */
 export async function runTaskCreation(input:{source:string;operationId:string;referenceTime:string},deps:Dependencies){
-  if(!input.operationId.trim()||input.operationId.length>240||input.operationId.includes('\0'))throw new Error('任务操作编号无效');
+  if(!input.operationId.trim()||input.operationId.length>240||input.operationId.includes('\0'))throw new PreparationError('任务操作编号无效');
   const before=await deps.readAccount();
   requireTaskGrant(before);
   const people=await deps.readPeople();
@@ -28,7 +29,7 @@ export async function runTaskCreation(input:{source:string;operationId:string;re
   if(plan.assigneeScope==='allContacts')await deps.verifyAllContacts?.();
   const current=await deps.readAccount();
   requireTaskGrant(current);
-  if(current.accountId!==before.accountId)throw new Error('飞书账号已切换，未创建任务。');
+  if(current.accountId!==before.accountId)throw new PreparationError('飞书账号已切换，未创建任务。');
   const receipt=await createTask(deps.cli,plan,input.operationId);
   const task={...receipt,assignee:(plan.assigneeIds??[plan.assigneeId]).map(id=>people.find(person=>person.id===id)!.name).join('、'),summary:plan.summary};
   try{await deps.onCreated?.(task,plan);}catch{

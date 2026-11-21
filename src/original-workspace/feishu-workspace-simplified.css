@@ -156,3 +156,50 @@
   color: var(--foreground);
   font-weight: 600;
 }
+.feishu-cli-bootstrap-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  margin-bottom: 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--muted, #f6f7f9);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.feishu-cli-bootstrap-banner[data-failed="true"] {
+  border-color: color-mix(in srgb, var(--destructive, #dc2626) 30%, var(--border));
+  background: color-mix(in srgb, var(--destructive, #dc2626) 5%, var(--background, #ffffff));
+}
+.feishu-cli-bootstrap-banner strong {
+  display: block;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--foreground);
+}
+.feishu-cli-bootstrap-banner p {
+  margin: 2px 0 0;
+  color: var(--muted-foreground);
+}
+.feishu-cli-bootstrap-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.feishu-cli-bootstrap-actions button {
+  padding: 6px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  border: 1px solid var(--border);
+  background: var(--background, #ffffff);
+  cursor: pointer;
+}
+.feishu-cli-bootstrap-actions button[data-primary="true"] {
+  background: var(--primary, #18181b);
+  color: var(--primary-foreground, #ffffff);
+  border-color: transparent;
+}
