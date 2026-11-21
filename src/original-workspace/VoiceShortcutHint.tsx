@@ -1,9 +1,11 @@
 import {Keyboard} from "lucide-react";
 import type {ExperimentsConfig} from "../experiments/client";
+import {formatHotkeyText} from "../lib/hotkeys";
 import "./voice-shortcut-hint.css";
 export function VoiceShortcutHint({purpose,config,onOpenSettings}:{purpose:"message"|"task"|"calendar";config:ExperimentsConfig;onOpenSettings?:()=>void}) {
   const label={message:"消息",task:"任务",calendar:"日程"}[purpose];
-  const hotkey=config.pluginShortcuts?.find(item=>item.pluginId==="vitalk-plugin-feishu"&&(item.purpose||"message")===purpose)?.hotkey.trim();
+  const rawHotkey=config.pluginShortcuts?.find(item=>item.pluginId==="vitalk-plugin-feishu"&&(item.purpose||"message")===purpose)?.hotkey.trim()??"";
+  const hotkey=rawHotkey?formatHotkeyText(rawHotkey):"";
   const disabled=!config.feishuTools;
   const content=<><Keyboard size={13}/>{hotkey?<><kbd>{hotkey}</kbd>{disabled&&<span>未启用</span>}</>:<span>设置快捷键</span>}</>;
   const name=hotkey?`查看${label}语音快捷键：${hotkey}${disabled?"，未启用":""}`:`设置${label}语音快捷键`;

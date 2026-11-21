@@ -66,3 +66,17 @@ it('does not write history when account switches during history IO',async()=>{
  await expect(createWorkspaceStateService(request as any,async()=>({accountId:current,scopes:[]})).appendHistory({id:'r',prompt:'x',text:'ok',status:'completed'},'ou_me')).rejects.toThrow('账号');
  expect(request.mock.calls.some(([m])=>m==='storage.set')).toBe(false);
 });
+it('skips redundant readAccount calls when verifiedAccount is passed and brackets saveCatalog with two checks',async()=>{
+ const values=new Map<string,unknown>([
+  ['workspace.ou_me',{accountId:'ou_me',entries:[],catalog:{recipients:[]},config:{},enabled:false}],
+  ['workspace-history.ou_me',[{id:'h1',prompt:'hi',text:'ok',status:'completed'}]],
+ ]);
+ const request=vi.fn(async(m:string,p:any)=>m==='storage.get'?{value:structuredClone(values.get(p.key)??null)}:(values.set(p.key,structuredClone(p.value)),{ok:true}));
+ const readAccount=vi.fn(async()=>({accountId:'ou_me',scopes:[]}));
+ const service=createWorkspaceStateService(request as any,readAccount);
+ expect((await service.read({accountId:'ou_me',scopes:[]})).accountId).toBe('ou_me');
+ expect(await service.readHistory({accountId:'ou_me',scopes:[]})).toHaveLength(1);
+ expect(readAccount).not.toHaveBeenCalled();
+ await service.saveCatalog({recipients:[],partial:true,lastSync:123},'ou_me');
+ expect(readAccount).toHaveBeenCalledTimes(2);
+});

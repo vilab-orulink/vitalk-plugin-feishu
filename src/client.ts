@@ -1,6 +1,7 @@
 import {readDraftCandidates} from './draft-candidates';
-import {personContext,PreparationError} from './person-context';
-import {CliNotAuthenticatedError} from './cli-auth';
+import {personContext,PreparationError,MessageNotSubmittedError} from './person-context';
+import {CliNotAuthenticatedError, type CliAuthStatus} from './cli-auth';
+import {createCliBootstrap,type CliRuntimeState} from './cli-bootstrap';
 import {createWorkspaceMessageService} from './workspace-message-service';
 import {createWorkspaceStateService} from './workspace-state-service';
 import {createFeishuRuntime} from './feishu-runtime';
@@ -21,15 +22,16 @@ export function getClient(){
 }
 let workspaceState:ReturnType<typeof createWorkspaceStateService>|undefined;
 let messageService:ReturnType<typeof createWorkspaceMessageService>|undefined;
+const preparedDraftAccounts=new Map<string,string>();
 export function getWorkspaceState(){return workspaceState??=createWorkspaceStateService(getClient().request,createFeishuRuntime((m,p,o)=>getClient().request(m,p,o)).readAccount);}
-async function messageContacts(signal?:AbortSignal,query?:string,requireComplete=false):Promise<MessageRecipient[]>{
- signal?.throwIfAborted();const state=await getWorkspaceState().read();signal?.throwIfAborted();
+async function messageContacts(signal?:AbortSignal,query?:string,requireComplete=false,verifiedAccount?:CliAuthStatus):Promise<MessageRecipient[]>{
+ signal?.throwIfAborted();const state=await getWorkspaceState().read(verifiedAccount);signal?.throwIfAborted();
  const runtime=createFeishuRuntime((m,p,o)=>{signal?.throwIfAborted();return getClient().request(m,p,{...o,signal});});
- const account=await runtime.readAccount();if(account.accountId!==state.accountId)throw Error('飞书账号已变化，请重新读取联系人');
+ const account=verifiedAccount??await runtime.readAccount();if(account.accountId!==state.accountId)throw new MessageNotSubmittedError('飞书账号已变化，请重新读取联系人');
  const cached=state.catalog.recipients.filter(r=>r.kind==='person').map(r=>({id:r.id,name:r.name,aliases:state.entries.filter(e=>e.recipientId===r.id).map(e=>e.query),active:false,external:true,...(r.isContact===false?{isContact:false}:{})}));
  const read=(args:string[])=>runtime.cli(args,`contacts-${crypto.randomUUID()}`);
  const catalog=query?await searchContacts(read,query,'message-search',{cached}):await syncContacts(read,'message-sync',{cached});
- if((await runtime.readAccount()).accountId!==account.accountId)throw Error('飞书账号已变化，请重新读取联系人');
+ if((await runtime.readAccount()).accountId!==account.accountId)throw new MessageNotSubmittedError('飞书账号已变化，请重新读取联系人');
  const contacts=catalog.people.filter(p=>p.isContact!==false);
  if(requireComplete&&(!contacts.length||contacts.some(p=>!p.active||p.external)))throw new PreparationError('未能完整核验全部个人联系人，未发送消息');
  const result:MessageRecipient[]=[...personContext(catalog.people,account.accountId,state.entries,!query).map(p=>({...p,kind:'person' as const})),...catalog.chats.map(c=>({id:c.id,name:c.name,aliases:state.entries.filter(e=>e.recipientId===c.id).map(e=>e.query),kind:'group' as const,active:c.active,external:c.external}))];
@@ -44,23 +46,69 @@ async function messageContacts(signal?:AbortSignal,query?:string,requireComplete
  await getWorkspaceState().saveCatalog({recipients,partial:true,lastSync:query?state.catalog.lastSync:Date.now()},account.accountId);
  return result;
 }
-async function selectedMessageContact(id:string,signal?:AbortSignal):Promise<MessageRecipient|undefined>{
- signal?.throwIfAborted();const state=await getWorkspaceState().read();
+async function selectedMessageContact(id:string,signal?:AbortSignal,verifiedAccount?:CliAuthStatus,skipPostAccountCheck=false):Promise<MessageRecipient|undefined>{
+ signal?.throwIfAborted();const state=await getWorkspaceState().read(verifiedAccount);
  const runtime=createFeishuRuntime((m,p,o)=>{signal?.throwIfAborted();return getClient().request(m,p,{...o,signal});});
- const account=await runtime.readAccount();if(account.accountId!==state.accountId)throw Error('飞书账号已变化，请重新读取联系人');
+ const account=verifiedAccount??await runtime.readAccount();if(account.accountId!==state.accountId)throw new MessageNotSubmittedError('飞书账号已变化，请重新读取联系人');
  const cached=state.catalog.recipients.find(r=>r.id===id);if(!cached||cached.kind==='bot')return undefined;
  const selected:MessageRecipient={id:cached.id,name:cached.name,kind:cached.kind,aliases:state.entries.filter(e=>e.recipientId===id).map(e=>e.query),active:false,external:true};
- const result=selected.kind==='person'&&selected.id===account.accountId?{...selected,active:true,external:false}:await readMessageRecipient(runtime.cli,selected,`contact-${crypto.randomUUID()}`);
- if((await runtime.readAccount()).accountId!==account.accountId)throw Error('飞书账号已变化，请重新读取联系人');
+ const read=(args:string[])=>runtime.cli(args,`contact-${crypto.randomUUID()}`);
+ const result=selected.kind==='person'&&selected.id===account.accountId?{...selected,active:true,external:false}:await readMessageRecipient(read,selected,'message-recipient');
+ if(!skipPostAccountCheck&&(await runtime.readAccount()).accountId!==account.accountId)throw new MessageNotSubmittedError('飞书账号已变化，请重新读取联系人');
  signal?.throwIfAborted();return result;
 }
-export function getMessageService(){return messageService??=createWorkspaceMessageService(getClient().request,{readAllRecipients:signal=>messageContacts(signal,undefined,true),readRecipient:selectedMessageContact,readDraftRecipients:signal=>readDraftCandidates(()=>getWorkspaceState().read(),messageContacts,signal),readRecipients:signal=>messageContacts(signal),readPreference:async signal=>{signal?.throwIfAborted();const state=await getWorkspaceState().read();signal?.throwIfAborted();return state.config.feishuMessageStyle??'';}});}
-async function workspaceSnapshot(){try{await createFeishuRuntime((m,p,o)=>getClient().request(m,p,o)).readAccount();}catch(error){if(!(error instanceof CliNotAuthenticatedError))throw error;return {config:{feishuTools:true,feishuRecipientModel:'llm',feishuMessageStyle:'',pluginShortcuts:[]},feishuCatalog:{recipients:[],partial:true,lastSync:null},feishuDraft:null,aiReplies:[]};}const state=await getWorkspaceState().read();return {config:state.config,feishuCatalog:state.catalog,feishuDraft:await getMessageService().read(),aiReplies:await getWorkspaceState().readHistory()};}
+const cliBootstrap = createCliBootstrap(() => (method, params, options) => getClient().request(method, params, options));
+export type { CliRuntimeState };
+export function ensureCliBackgroundInstall() {
+  if (!cliBootstrap.getState().installed) {
+    void cliBootstrap.install({ manual: false });
+  }
+}
+function emptyWorkspaceSnapshot(cliRuntime?: CliRuntimeState) {
+  return {
+    config: { feishuTools: true, feishuRecipientModel: 'llm' as const, feishuMessageStyle: '', pluginShortcuts: [] },
+    feishuCatalog: { recipients: [], partial: true, lastSync: null },
+    feishuDraft: null,
+    aiReplies: [],
+    ...(cliRuntime ? { cliRuntime } : {}),
+  };
+}
+export function getMessageService(){return messageService??=createWorkspaceMessageService(getClient().request,{readAllRecipients:(signal,verified)=>messageContacts(signal,undefined,true,verified),readRecipient:(id,signal,verified,skipPost)=>selectedMessageContact(id,signal,verified,skipPost),readDraftRecipients:(signal,verified)=>readDraftCandidates(()=>getWorkspaceState().read(verified),s=>messageContacts(s,undefined,false,verified),signal),readRecipients:(signal,verified)=>messageContacts(signal,undefined,false,verified),searchRecipients:(query,signal,verified)=>messageContacts(signal,query,false,verified),readPreference:async(signal,verified,requireVoiceEnabled)=>{signal?.throwIfAborted();const state=await getWorkspaceState().read(verified);signal?.throwIfAborted();if(requireVoiceEnabled&&state.config?.feishuTools===false)throw new PreparationError('飞书语音指令已关闭，请在飞书插件设置中开启后再试');return state.config?.feishuMessageStyle??'';},onDraftPrepared:(draftId,accountId)=>{if(preparedDraftAccounts.size>=32){const oldest=preparedDraftAccounts.keys().next().value;if(oldest)preparedDraftAccounts.delete(oldest);}preparedDraftAccounts.set(draftId,accountId);}});}
+export async function readVoiceMessageContext(draftId:string,signal:AbortSignal){
+ signal.throwIfAborted();
+ const accountId=preparedDraftAccounts.get(draftId);
+ const verified:CliAuthStatus|undefined=accountId?{accountId,scopes:[]}:undefined;
+ const [history,state]=await Promise.all([getWorkspaceState().readHistory(verified),getWorkspaceState().read(verified)]);
+ signal.throwIfAborted();
+ return {recipients:state.catalog.recipients,history};
+}
+async function workspaceSnapshot(){
+  if (cliBootstrap.getState().status === 'installing') {
+    return emptyWorkspaceSnapshot(cliBootstrap.getState());
+  }
+  let verifiedAccount:CliAuthStatus;
+  try {
+    verifiedAccount = await createFeishuRuntime((m,p,o)=>getClient().request(m,p,o)).readAccount();
+    cliBootstrap.markInstalled();
+  } catch (error) {
+    if (error instanceof CliNotAuthenticatedError) {
+      cliBootstrap.markInstalled();
+      return emptyWorkspaceSnapshot(cliBootstrap.getState());
+    }
+    const missing = await cliBootstrap.recoverMissingCliFromRead(error);
+    if (missing) return emptyWorkspaceSnapshot(missing);
+    throw error;
+  }
+  const state=await getWorkspaceState().read(verifiedAccount);
+  const [feishuDraft,aiReplies]=await Promise.all([getMessageService().read(verifiedAccount),getWorkspaceState().readHistory(verifiedAccount)]);
+  return {config:state.config,feishuCatalog:state.catalog,feishuDraft,aiReplies,cliRuntime:cliBootstrap.getState()};
+}
 let authService:ReturnType<typeof createCliAuthService>|undefined;
 function auth(){return authService??=createCliAuthService((method,params,options)=>getClient().request(method,params,options),AUTH_SCOPES,url=>QRCode.toDataURL(url,{width:240,margin:2}));}
 let authorizationGeneration=0;
 export async function registerFeishuApplication(onUrl:(flow:{verificationUrl:string;qrDataUrl:string;flowId:string;stage:'registration'})=>void){
  const generation=++authorizationGeneration;
+ await cliBootstrap.ensureInstalledForInteractive();
  const service=auth();
  let rendering=Promise.resolve();
  let renderError:Error|undefined;
@@ -93,13 +141,41 @@ export async function feishu<T>(action:string,params:Record<string,unknown>={}):
     if(action==='feishuDismiss')return await getMessageService().dismiss(params) as T;
     if(action==='feishuRecall')return await getMessageService().recall(params) as T;
     if(action==='feishuSearch'||action==='feishuSync'){const recipients=await messageContacts(undefined,action==='feishuSearch'?String(params.query??''):undefined);return {recipients,partial:true,lastSync:action==='feishuSync'?Date.now():null,searchQuery:params.query} as T;}
-    if(action==='feishuAuthStatus')return await auth().snapshot() as T;
-    if(action==='feishuAuthStart')return await auth().startLogin() as T;
+    if(action==='feishuAuthStatus'){
+      if (cliBootstrap.getState().status === 'installing') {
+        return { connected: false, cliMissing: true, cliStatus: 'installing', message: '正在准备飞书运行组件，完成后即可连接飞书' } as T;
+      }
+      try {
+        const snapshot = await auth().snapshot();
+        cliBootstrap.markInstalled();
+        return snapshot as T;
+      } catch (error) {
+        const missing = await cliBootstrap.recoverMissingCliFromRead(error);
+        if (missing) {
+          return {
+            connected: false,
+            cliMissing: true,
+            cliStatus: missing.status,
+            ...(missing.error ? { cliError: missing.error } : {}),
+            message: missing.status === 'failed'
+              ? (missing.error || '飞书运行组件安装失败，请重试安装')
+              : '正在准备飞书运行组件，完成后即可连接飞书',
+          } as T;
+        }
+        throw error;
+      }
+    }
+    if(action==='feishuAuthStart'){
+      if(cliBootstrap.needsInteractiveInstall())await cliBootstrap.ensureInstalledForInteractive();
+      return await auth().startLogin() as T;
+    }
     if(action==='feishuAuthComplete'){await auth().complete(String(params.flowId??''));return await auth().snapshot() as T;}
     if(action==='feishuAuthCancel'){cancelFeishuAuthorization();return {ok:true} as T;}
-    if (action === 'feishuPluginCliStatus' || action === 'feishuPluginCliInstall') {
-      const method = action === 'feishuPluginCliStatus' ? 'native.status' : 'native.install';
-      return await getClient().request(method, { dependencyId: 'lark-cli' }, { timeoutMs }) as T;
+    if (action === 'feishuPluginCliStatus') {
+      return await cliBootstrap.status(timeoutMs) as T;
+    }
+    if (action === 'feishuPluginCliInstall') {
+      return await cliBootstrap.install({ manual: true, timeoutMs }) as T;
     }
     throw Error('当前飞书插件不支持此操作，请更新插件后重试。');
   } catch (error) {
@@ -113,4 +189,4 @@ export async function feishu<T>(action:string,params:Record<string,unknown>={}):
 export async function openFeishuUrl(url:string):Promise<void>{
   await getClient().request('host.openExternal',{url});
 }
-export function dispose(){workspaceState=undefined;messageService=undefined;cancelFeishuAuthorization();authService=undefined;client?.dispose();client=undefined;}
+export function dispose(){preparedDraftAccounts.clear();cliBootstrap.reset();workspaceState=undefined;messageService=undefined;cancelFeishuAuthorization();authService=undefined;client?.dispose();client=undefined;}

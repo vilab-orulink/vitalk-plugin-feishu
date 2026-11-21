@@ -1,5 +1,6 @@
 import {getClient} from './client';
 import {createIntentModel} from './intent-model';
+import {PreparationError} from './person-context';
 import {midnight,shiftDate,validDate,type CalendarItem,type EventTime} from './original-workspace/workspace-calendar';
 import {
   completeWorkspaceTask,deleteWorkspaceTask,editWorkspaceTask,listWorkspaceTasks,
@@ -40,10 +41,10 @@ function queryWindow(source:string,result:Row) {
   const {startDate,endDate,dateEvidence} = result;
   if (typeof startDate !== 'string' || typeof endDate !== 'string' || !validDate(startDate) ||
       !validDate(endDate) || endDate < startDate || !evidence(source,dateEvidence)) {
-    throw new Error('请补充要操作的日程原日期。');
+    throw new PreparationError('请补充要操作的日程原日期。');
   }
   const start = midnight(startDate), end = midnight(shiftDate(endDate,1));
-  if (end - start > 32 * 86400) throw new Error('请将要操作的日程范围缩小到 32 天以内。');
+  if (end - start > 32 * 86400) throw new PreparationError('请将要操作的日程范围缩小到 32 天以内。');
   return {start,end,startDate,endDate};
 }
 
@@ -56,10 +57,10 @@ async function taskCandidates(deps:Dependencies,signal?:AbortSignal) {
     signal?.throwIfAborted();
     const result = await deps.tasks({pageToken},signal);
     accountId ??= result.accountId;
-    if (!accountId || accountId !== result.accountId) throw new Error('飞书账号已变化，未执行任务操作。');
+    if (!accountId || accountId !== result.accountId) throw new PreparationError('飞书账号已变化，未执行任务操作。');
     for (const item of result.items) {
       const id = item.id.toLowerCase();
-      if (ids.has(id)) throw new Error('飞书任务列表已变化，请重新查询。');
+      if (ids.has(id)) throw new PreparationError('飞书任务列表已变化，请重新查询。');
       ids.add(id);
       items.push(item);
     }
@@ -68,7 +69,7 @@ async function taskCandidates(deps:Dependencies,signal?:AbortSignal) {
     if (!pageToken || pages.has(pageToken)) break;
     pages.add(pageToken);
   }
-  throw new Error('任务列表未完整查询，请在飞书插件详情页选择任务。');
+  throw new PreparationError('任务列表未完整查询，请在飞书插件详情页选择任务。');
 }
 
 function describe(item:Candidate) {
@@ -83,20 +84,20 @@ function editFields(kind:Kind,result:Row,action:Mutation) {
   const changes = data(result.changes);
   const keys = kind === 'task' ? ['title','description'] : ['title','description','start','end'];
   if (!changes || !Object.keys(changes).length || Object.entries(changes).some(([key,value])=>!keys.includes(key) || typeof value !== 'string')) {
-    throw new Error('未能确认要修改的字段，请明确新的标题、说明或时间。');
+    throw new PreparationError('未能确认要修改的字段，请明确新的标题、说明或时间。');
   }
   return changes;
 }
 
 function changedTime(value:unknown,original:EventTime):EventTime {
   if (value === undefined) return original.date ? {date:original.date} : {timestamp:original.timestamp};
-  if (typeof value !== 'string') throw new Error('日程时间不明确。');
+  if (typeof value !== 'string') throw new PreparationError('日程时间不明确。');
   if (original.date && validDate(value)) return {date:value};
   if (!original.date && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\d{2})$/.test(value) &&
       validDate(value.slice(0,10)) && Number.isFinite(Date.parse(value))) {
     return {timestamp:String(Date.parse(value)/1000)};
   }
-  throw new Error('请明确日程的新日期或时间。');
+  throw new PreparationError('请明确日程的新日期或时间。');
 }
 
 export function createVoiceOperationWorkflow(deps:Dependencies) {
@@ -104,7 +105,7 @@ export function createVoiceOperationWorkflow(deps:Dependencies) {
     signal?.throwIfAborted();
     if (!prompt.trim() || prompt.length > 32_000 || !operationId.trim() || operationId.length > 240 || operationId.includes('\0') ||
         !/T.*(?:Z|[+-]\d{2}:\d{2})$/.test(referenceTime) || !Number.isFinite(Date.parse(referenceTime))) {
-      throw new Error('语音操作内容或参考时间无效。');
+      throw new PreparationError('语音操作内容或参考时间无效。');
     }
     const context = {kind,source:prompt,referenceTime,timeZone:'Asia/Shanghai'};
     const intent = await deps.model(context,classify);
@@ -112,34 +113,34 @@ export function createVoiceOperationWorkflow(deps:Dependencies) {
     const {action,targetEvidence} = intent;
     if (action === 'create') return {kind:'create'};
     if ((action !== 'edit' && action !== 'delete' && !(action === 'complete' && kind === 'task')) ||
-        !evidence(prompt,targetEvidence)) throw new Error(invalidTarget);
+        !evidence(prompt,targetEvidence)) throw new PreparationError(invalidTarget);
     const window = kind === 'calendar' ? queryWindow(prompt,intent) : undefined;
     const found = window
       ? await deps.calendar({start:window.start,end:window.end,requireComplete:true},signal)
       : await taskCandidates(deps,signal);
     signal?.throwIfAborted();
-    if (!found.accountId || !found.items.length) throw new Error(invalidTarget);
-    if (found.items.length > 200) throw new Error('匹配范围内记录过多，请缩小范围。');
+    if (!found.accountId || !found.items.length) throw new PreparationError(invalidTarget);
+    if (found.items.length > 200) throw new PreparationError('匹配范围内记录过多，请缩小范围。');
     const details = found.items.map(describe);
     const candidates = details.map((candidate,index)=>({index,...candidate}));
-    if (JSON.stringify(candidates).length > 48_000) throw new Error('匹配范围内记录内容过多，请缩小范围。');
+    if (JSON.stringify(candidates).length > 48_000) throw new PreparationError('匹配范围内记录内容过多，请缩小范围。');
     const query = {...context,action,targetEvidence,window,dateEvidence:intent.dateEvidence,candidates};
     const match = await deps.model(query,select);
     signal?.throwIfAborted();
     const indices = match.candidateIndices;
     if (!Array.isArray(indices) || indices.length !== 1 || !Number.isSafeInteger(indices[0]) ||
-        indices[0] < 0 || indices[0] >= found.items.length) throw new Error(invalidTarget);
+        indices[0] < 0 || indices[0] >= found.items.length) throw new PreparationError(invalidTarget);
     const chosenIndex = indices[0] as number;
     const identity = JSON.stringify(details[chosenIndex]);
     if (details.some((candidate,index)=>index !== chosenIndex && JSON.stringify(candidate) === identity)) {
-      throw new Error('有多条记录的现有信息无法区分，请在飞书插件详情页选择要操作的记录。');
+      throw new PreparationError('有多条记录的现有信息无法区分，请在飞书插件详情页选择要操作的记录。');
     }
     const chosen = found.items[chosenIndex];
     const changes = editFields(kind,match,action);
     const audit = await deps.model({...query,chosenIndex,changes},verify);
     signal?.throwIfAborted();
     if (audit.supported !== true || audit.unique !== true || audit.changesSupported !== true) {
-      throw new Error('未通过语音操作核对，请明确目标和要求后再试。');
+      throw new PreparationError('未通过语音操作核对，请明确目标和要求后再试。');
     }
     const target = {id:chosen.id,accountId:found.accountId};
     const label = kind === 'task' ? '任务' : '日程';
@@ -154,7 +155,7 @@ export function createVoiceOperationWorkflow(deps:Dependencies) {
         ...target,operationId,title:changes.title ?? chosen.title,description:changes.description ?? chosen.description,expected:chosen,
       },signal);
     } else if ('calendarId' in found && 'start' in chosen) {
-      if (chosen.editable === false || !/^[A-Za-z0-9_-]{1,120}_0$/.test(chosen.id)) throw new Error('请在飞书中处理重复日程。');
+      if (chosen.editable === false || !/^[A-Za-z0-9_-]{1,120}_0$/.test(chosen.id)) throw new PreparationError('请在飞书中处理重复日程。');
       const eventTarget = {...target,calendarId:found.calendarId};
       if (action === 'delete') result = await deps.deleteEvent(eventTarget,signal);
       else {
@@ -165,7 +166,7 @@ export function createVoiceOperationWorkflow(deps:Dependencies) {
           start:changedTime(changes.start,original.start),end:changedTime(changes.end,original.end),expected:original,
         },signal);
       }
-    } else throw new Error(invalidTarget);
+    } else throw new PreparationError(invalidTarget);
     if (result.status === 'uncertain') throw new Error(result.message);
     const expectedStatus = action === 'delete' ? 'deleted' : action === 'complete' ? 'completed' : kind === 'task' ? 'updated' : 'eventUpdated';
     if (result.status !== expectedStatus) throw new Error('飞书尚未返回可确认的操作结果。');

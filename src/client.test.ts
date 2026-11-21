@@ -113,3 +113,92 @@ it('rejects unmigrated business actions without invoking desktop Feishu business
  expect(send).not.toHaveBeenCalled();
  await expect(promise).rejects.toThrow('不支持');
 });
+
+it('returns a degraded workspace snapshot and starts single-flight CLI auto-install when host reports dependency_not_installed', async () => {
+  (window as Window & { __VITALK_PLUGIN_TOKEN__?: string }).__VITALK_PLUGIN_TOKEN__ = 'test-token';
+  const send = vi.spyOn(window.parent, 'postMessage').mockImplementation(() => {});
+  const changed = vi.fn();
+  window.addEventListener('feishu-workspace-changed', changed);
+  try {
+    const readPromise = feishu<any>('feishuWorkspaceRead');
+    const authPromise = feishu<any>('feishuAuthStatus');
+    expect(send).toHaveBeenCalledTimes(2);
+    for (const [req] of send.mock.calls) {
+      window.dispatchEvent(new MessageEvent('message', {
+        source: window.parent,
+        data: {
+          channel: 'vitalk-plugin/v1',
+          token: 'test-token',
+          id: req.id,
+          error: { code: 'dependency_not_installed', message: '本机运行组件尚未安装' },
+        },
+      }));
+    }
+    const [workspace, auth] = await Promise.all([readPromise, authPromise]);
+    expect(workspace).toMatchObject({
+      feishuDraft: null,
+      feishuCatalog: { recipients: [] },
+      cliRuntime: { installed: false, status: 'installing' },
+    });
+    expect(auth).toMatchObject({
+      connected: false,
+      cliMissing: true,
+      cliStatus: 'installing',
+    });
+    const installs = send.mock.calls.map(([r]) => r).filter(r => r.method === 'native.install');
+    expect(installs).toHaveLength(1);
+    window.dispatchEvent(new MessageEvent('message', {
+      source: window.parent,
+      data: {
+        channel: 'vitalk-plugin/v1',
+        token: 'test-token',
+        id: installs[0].id,
+        result: { installed: true, managed: true, version: '1.0.98' },
+      },
+    }));
+    await vi.waitFor(() => expect(changed).toHaveBeenCalled());
+  } finally {
+    window.removeEventListener('feishu-workspace-changed', changed);
+  }
+});
+
+it('verifies missing CLI via native.status on legacy 0.6.23 native_outcome_unknown and avoids blank-page error', async () => {
+  (window as Window & { __VITALK_PLUGIN_TOKEN__?: string }).__VITALK_PLUGIN_TOKEN__ = 'test-token';
+  const send = vi.spyOn(window.parent, 'postMessage').mockImplementation(() => {});
+  const readPromise = feishu<any>('feishuWorkspaceRead');
+  const execReq = send.mock.calls[0][0];
+  expect(execReq.method).toBe('native.execute');
+  window.dispatchEvent(new MessageEvent('message', {
+    source: window.parent,
+    data: {
+      channel: 'vitalk-plugin/v1',
+      token: 'test-token',
+      id: execReq.id,
+      error: { code: 'native_outcome_unknown', message: '本机组件未确认操作结果，请先核对远端状态；保留原操作编号，不要重复提交。' },
+    },
+  }));
+  await vi.waitFor(() => expect(send.mock.calls.some(([r]) => r.method === 'native.status')).toBe(true));
+  const statusReq = send.mock.calls.map(([r]) => r).find(r => r.method === 'native.status')!;
+  window.dispatchEvent(new MessageEvent('message', {
+    source: window.parent,
+    data: {
+      channel: 'vitalk-plugin/v1',
+      token: 'test-token',
+      id: statusReq.id,
+      result: { installed: false, managed: true },
+    },
+  }));
+  const workspace = await readPromise;
+  expect(workspace.cliRuntime).toMatchObject({ installed: false, status: 'installing' });
+  const installReqs = send.mock.calls.map(([r]) => r).filter(r => r.method === 'native.install');
+  expect(installReqs).toHaveLength(1);
+  window.dispatchEvent(new MessageEvent('message', {
+    source: window.parent,
+    data: {
+      channel: 'vitalk-plugin/v1',
+      token: 'test-token',
+      id: installReqs[0].id,
+      result: { installed: true, managed: true, version: '1.0.98' },
+    },
+  }));
+});

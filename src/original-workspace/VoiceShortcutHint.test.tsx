@@ -17,3 +17,9 @@ it("marks a saved key as disabled when the feature is off and supports legacy me
   render(<VoiceShortcutHint purpose="message" config={{feishuTools:false,pluginShortcuts:[{pluginId:"vitalk-plugin-feishu",hotkey:"Shift+Z",trigger:"toggle"}]}} onOpenSettings={()=>{}}/>);
   expect(screen.getByRole("button",{name:"查看消息语音快捷键：Shift+Z，未启用"}).textContent).toContain("未启用");
 });
+it("formats canonical CommandOrControl hotkeys into human-readable labels",()=>{
+  render(<VoiceShortcutHint purpose="message" config={{feishuTools:true,pluginShortcuts:[{pluginId:"vitalk-plugin-feishu",purpose:"message",hotkey:"CommandOrControl+U",trigger:"toggle"}]}} onOpenSettings={()=>{}}/>);
+  const button=screen.getByRole("button",{name:/查看消息语音快捷键：(?:Ctrl|Cmd)\+U/});
+  expect(button.textContent).toMatch(/^(Ctrl|Cmd)\+U$/);
+  expect(button.textContent).not.toContain("CommandOrControl");
+});

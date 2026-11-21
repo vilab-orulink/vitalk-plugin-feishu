@@ -2,6 +2,7 @@ import { MessageStyleSettings } from "./MessageStyleSettings";
 import {openPluginHistory} from '../plugin-history-notice';
 import { RecipientMemoryPanel } from "./RecipientMemoryPanel";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { isTemporarilyUnavailable } from "../cli-bootstrap";
 import {
   experimentsRequest,
   type AiReply,
@@ -50,6 +51,7 @@ export function QuickMessagePage() {
   const [visited, setVisited] = useState(()=>new Set<FeishuTab>(["messages"]));
   const [auth, setAuth] = useState<FeishuAuthStatus>();
   const [authPending, setAuthPending] = useState(true);
+  const [cliRetrying, setCliRetrying] = useState(false);
   const authVersion = useRef(0);
   const acceptAuth = useCallback((value: FeishuAuthStatus | undefined) => {
     if (value) {
@@ -57,6 +59,17 @@ export function QuickMessagePage() {
       setAuth(value);
       setAuthPending(false);
     }
+  }, []);
+  const refreshAuthStatus = useCallback(() => {
+    const version = ++authVersion.current;
+    return experimentsRequest<FeishuAuthStatus>({ action: "feishuAuthStatus" })
+      .then((value) => {
+        if (version === authVersion.current) setAuth(value);
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (version === authVersion.current) setAuthPending(false);
+      });
   }, []);
   useEffect(() => {
     let active = true;
@@ -69,15 +82,21 @@ export function QuickMessagePage() {
       .finally(() => {
         if (active && version === authVersion.current) setAuthPending(false);
       });
+    const onCliChanged = () => {
+      if (active) void refreshAuthStatus();
+    };
+    window.addEventListener("feishu-cli-state-changed", onCliChanged);
     return () => {
       active = false;
+      window.removeEventListener("feishu-cli-state-changed", onCliChanged);
     };
-  }, []);
+  }, [refreshAuthStatus]);
   const pageRegion = useRef<HTMLElement>(null);
   const liveReplies = useRef(new Map<string, AiReply>());
   useEffect(() => {
     let active = true;
-
+    let transientRetries = 0;
+    let retryTimer: number | undefined;
     let inflight: Promise<void> | undefined;
     const refresh = () => {
       if (inflight) return inflight;
@@ -85,17 +104,28 @@ export function QuickMessagePage() {
       inflight = experimentsRequest<ExperimentsSnapshot>({ action: "read" })
         .then((s) => {
           if (active) {
+            transientRetries = 0;
+            window.clearTimeout(retryTimer);
             setSnapshot(retainLiveReplies(s, liveReplies.current));
             setReadError("");
+            setError((prev) => (prev === "开发连接正在核验，请稍后重试" ? "" : prev));
           }
         })
         .catch((e) => {
-          if (active)
-            setReadError(
-              e instanceof TypeError
-                ? "无法读取语音发送设置，请在 ViTalk 桌面端打开后重试。"
-                : String(e instanceof Error ? e.message : e),
-            );
+          if (!active) return;
+          if (isTemporarilyUnavailable(e) && transientRetries < 3) {
+            transientRetries += 1;
+            window.clearTimeout(retryTimer);
+            retryTimer = window.setTimeout(() => {
+              if (active) void refresh();
+            }, 850);
+            return;
+          }
+          setReadError(
+            e instanceof TypeError
+              ? "无法读取语音发送设置，请在 ViTalk 桌面端打开后重试。"
+              : String(e instanceof Error ? e.message : e),
+          );
         }).finally(() => {
           inflight = undefined;
 
@@ -112,7 +142,7 @@ export function QuickMessagePage() {
     void refresh();
     return () => {
       active = false;
-
+      window.clearTimeout(retryTimer);
       window.removeEventListener("focus",onWorkspaceChanged);
       window.removeEventListener("feishu-workspace-changed",onWorkspaceChanged);
       window.removeEventListener("feishu-message-draft-ready",onDraft);
@@ -149,7 +179,17 @@ export function QuickMessagePage() {
         </div>
         <div className="feishu-header-actions">
           <button type="button" className="feishu-connection-shortcut" onClick={()=>setTab("settings")}>
-            {authPending ? "检查连接…" : auth?.allPermissionsGranted ? "飞书已连接" : auth?.connected || auth?.taskConnected || auth?.calendarConnected ? "需补充授权" : "连接飞书"}
+            {snapshot?.cliRuntime?.installed === false
+              ? snapshot.cliRuntime.status === "installing" || cliRetrying
+                ? "准备组件中…"
+                : "安装飞书组件"
+              : authPending
+                ? "检查连接…"
+                : auth?.allPermissionsGranted
+                  ? "飞书已连接"
+                  : auth?.connected || auth?.taskConnected || auth?.calendarConnected
+                    ? "需补充授权"
+                    : "连接飞书"}
           </button>
           <div className="feishu-header-voice-slot" ref={setVoiceContainer}>
           {snapshot && (tab === "tasks" || tab === "meetings") && (
@@ -174,6 +214,47 @@ export function QuickMessagePage() {
           </div>
         </div>
       </header>
+      {snapshot?.cliRuntime?.installed === false && (
+        snapshot.cliRuntime.status === "installing" || cliRetrying ? (
+          <div role="status" className="feishu-cli-bootstrap-banner">
+            <div>
+              <strong>正在准备飞书本地运行组件…</strong>
+              <p>首次启用时会自动下载并校验飞书运行环境，完成后将自动就绪。</p>
+            </div>
+            <div className="feishu-cli-bootstrap-actions">
+              <button type="button" onClick={() => setTab("settings")}>查看连接设置</button>
+            </div>
+          </div>
+        ) : (
+          <section aria-label="准备飞书运行组件" className="feishu-cli-bootstrap-banner" data-failed="true">
+            <div>
+              <strong>飞书本地运行组件尚未就绪</strong>
+              <p>{snapshot.cliRuntime.error || "飞书运行组件下载未完成，请检查网络后重试。"}</p>
+            </div>
+            <div className="feishu-cli-bootstrap-actions">
+              <button
+                type="button"
+                data-primary="true"
+                disabled={cliRetrying}
+                onClick={() => {
+                  setCliRetrying(true);
+                  setError("");
+                  void experimentsRequest({ action: "feishuPluginCliInstall" })
+                    .then(() => {
+                      window.dispatchEvent(new Event("feishu-workspace-changed"));
+                      void refreshAuthStatus();
+                    })
+                    .catch((e) => setError(String(e instanceof Error ? e.message : e)))
+                    .finally(() => setCliRetrying(false));
+                }}
+              >
+                重试安装组件
+              </button>
+              <button type="button" onClick={() => setTab("settings")}>连接设置</button>
+            </div>
+          </section>
+        )
+      )}
       {(error || readError) && <p role="alert">{error || readError}</p>}
       {!snapshot ? (
         error || readError ? null : (
@@ -250,7 +331,7 @@ export function QuickMessagePage() {
                       void experimentsRequest<ExperimentsSnapshot>({
                         action: "read",
                       })
-                        .then(setSnapshot)
+                        .then((s) => setSnapshot(retainLiveReplies(s, liveReplies.current)))
                         .catch((e) => setError(String(e)));
                     }}
                   />

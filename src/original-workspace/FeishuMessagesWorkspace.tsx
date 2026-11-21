@@ -290,7 +290,7 @@ export function FeishuMessagesWorkspace({ snapshot, onDraftUpdate, onOpenShortcu
         changed.current?.(draftRef.current);
       }
     } catch (failure) {
-      if (failure instanceof Error && "code" in failure && failure.code === "message_not_submitted") {
+      if (failure instanceof Error && "code" in failure && (failure.code === "message_not_submitted" || failure.code === "NOT_SUBMITTED")) {
         if (active.current && draftRef.current?.id === frozen.id && draftRef.current.status === "sending") {
           attempted.current.delete(frozen.id);
           commit({ ...frozen, status: "ready", error: failure.message }, true);

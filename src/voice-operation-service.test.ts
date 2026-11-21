@@ -1,4 +1,5 @@
 import {describe,expect,it,vi} from 'vitest';
+import {PreparationError} from './person-context';
 import {createVoiceOperationWorkflow} from './voice-operation-service';
 
 const operationId='a9dd64a6-4de5-4cc9-81d1-d09330a34872';
@@ -43,7 +44,8 @@ describe('voice record operations',()=>{
 
   it.each([{indices:[0,1]},{indices:[88]}])('rejects ambiguous or fabricated model candidate indices %j',async ({indices})=>{
     const {deps,run}=setup({action:'delete',targetEvidence:'核对资料'},{candidateIndices:indices},review);
-    await expect(run({...taskInput,prompt:'核对资料那条不用留了'})).rejects.toThrow(/唯一/);
+    const err=await run({...taskInput,prompt:'核对资料那条不用留了'}).catch(e=>e);
+    expect(err).toBeInstanceOf(PreparationError);expect(err.message).toMatch(/唯一/);
     expect(deps.deleteTask).not.toHaveBeenCalled();
   });
 
@@ -51,7 +53,8 @@ describe('voice record operations',()=>{
     const prompt='明天的项目例会取消掉';
     const {deps,run}=setup({action:'delete',targetEvidence:'项目例会',dateEvidence:'明天',startDate:'2027-01-15',endDate:'2027-01-15'},
       {candidateIndices:[0]},{...review,unique:false});
-    await expect(run({kind:'calendar',prompt,operationId,referenceTime})).rejects.toThrow(/核对/);
+    const err=await run({kind:'calendar',prompt,operationId,referenceTime}).catch(e=>e);
+    expect(err).toBeInstanceOf(PreparationError);expect(err.message).toMatch(/核对/);
     expect(deps.deleteEvent).not.toHaveBeenCalled();
   });
 
@@ -87,7 +90,8 @@ it('keeps a recurring calendar result out of the deletion service even with posi
   const {deps,run}=setup({action:'delete',targetEvidence:'项目例会',dateEvidence:'明天',startDate:'2027-01-15',endDate:'2027-01-15'},
     {candidateIndices:[0]},review);
   deps.calendar.mockResolvedValue({items:[{...event,editable:false}],accountId:owner,calendarId:'cal_1'});
-  await expect(run({kind:'calendar',prompt:'明天的项目例会取消掉',operationId,referenceTime})).rejects.toThrow(/重复日程/);
+  const err=await run({kind:'calendar',prompt:'明天的项目例会取消掉',operationId,referenceTime}).catch(e=>e);
+  expect(err).toBeInstanceOf(PreparationError);expect(err.message).toMatch(/重复日程/);
   expect(deps.deleteEvent).not.toHaveBeenCalled();
 });
 
@@ -95,7 +99,8 @@ it('uses the selected calendar record and preserves an uncertain delete receipt'
   const {deps,run}=setup({action:'delete',targetEvidence:'项目例会',dateEvidence:'明天',startDate:'2027-01-15',endDate:'2027-01-15'},
     {candidateIndices:[0]},review);
   deps.deleteEvent.mockResolvedValue({status:'uncertain',message:'请在飞书核对，本次操作不会再次提交。'});
-  await expect(run({kind:'calendar',prompt:'明天的项目例会取消掉',operationId,referenceTime})).rejects.toThrow(/不会再次提交/);
+  const err=await run({kind:'calendar',prompt:'明天的项目例会取消掉',operationId,referenceTime}).catch(e=>e);
+  expect(err).not.toBeInstanceOf(PreparationError);expect(err.message).toMatch(/不会再次提交/);
   expect(deps.deleteEvent).toHaveBeenCalledOnce();
   expect(deps.deleteEvent).toHaveBeenCalledWith({id:event.id,accountId:owner,calendarId:'cal_1'},undefined);
 });

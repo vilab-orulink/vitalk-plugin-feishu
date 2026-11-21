@@ -1,5 +1,6 @@
 import {expect,it,vi} from 'vitest';
 import {createCalendar} from './calendar-service';
+import {PreparationError} from './person-context';
 
 const operationId = '13bf963b-8419-41e0-9a83-83f1330c5799';
 const plan = {summary:'项目评审',description:'带电脑',start:'2026-11-08T15:00:00+08:00',end:'2026-11-08T15:30:00+08:00',participantIds:['ou_b','ou_a','ou_b']};
@@ -33,20 +34,27 @@ it('uses the desktop CLI shapes, stable stage IDs and verified attendee receipts
 it('stops before creation when availability is busy or malformed',async()=>{
   for(const busy of [{freebusy_list:[{}]},{freebusy_list:null},{},{unrecognized:[]}]){
     const cli=vi.fn().mockResolvedValueOnce(calendar).mockResolvedValueOnce(busy);
-    await expect(createCalendar(cli,plan,operationId)).rejects.toThrow(/尚未预约/);
+    const rejection=createCalendar(cli,plan,operationId);
+    await expect(rejection).rejects.toThrow(/尚未预约/);
+    await expect(rejection).rejects.toBeInstanceOf(PreparationError);
     expect(cli).toHaveBeenCalledTimes(2);
   }
 });
 
 it.each([{summary:'  '},{summary:'字'.repeat(501)},{description:'字'.repeat(2667)}])('rejects invalid title or description before calling the CLI',async patch=>{
   const cli=vi.fn();
-  await expect(createCalendar(cli,{...plan,...patch},operationId)).rejects.toThrow(/标题|说明/);
+  const rejection=createCalendar(cli,{...plan,...patch},operationId);
+  await expect(rejection).rejects.toThrow(/标题|说明/);
+  await expect(rejection).rejects.toBeInstanceOf(PreparationError);
   expect(cli).not.toHaveBeenCalled();
 });
 
 it('keeps an uncertain creation terminal within the call and skips invitations',async()=>{
   const cli=vi.fn().mockResolvedValueOnce(calendar).mockRejectedValueOnce(new Error('connection lost'));
-  await expect(createCalendar(cli,{...plan,allowConflict:true},operationId)).rejects.toThrow(/未确认.*不会重复预约/);
+  const rejection=createCalendar(cli,{...plan,allowConflict:true},operationId);
+  await expect(rejection).rejects.toThrow(/未确认.*不会重复预约/);
+  const err=await rejection.catch(e=>e);
+  expect(err).not.toBeInstanceOf(PreparationError);
   expect(cli).toHaveBeenCalledTimes(2);
 });
 

@@ -1,4 +1,5 @@
 import {calendarEventUrl} from './calendar-event-url';
+import {PreparationError} from './person-context';
 import type {Cli} from './task-service';
 
 export type CalendarCreatePlan = Readonly<{
@@ -51,22 +52,22 @@ function timestamp(value: string): number {
  * supply beforeSubmit to recheck the current account and cancellation state. */
 export async function createCalendar(cli: Cli, plan: CalendarCreatePlan, operationId: string, options: Options = {}): Promise<CalendarReceipt> {
   if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(operationId)) {
-    throw new Error('日程操作编号必须是有效 UUID。');
+    throw new PreparationError('日程操作编号必须是有效 UUID。');
   }
   const {summary,description,start,end,allowConflict} = plan;
   if (typeof summary !== 'string' || !summary.trim() || [...summary].length > 500 || summary.includes('\0')) {
-    throw new Error('日程标题须为 1 到 500 字，尚未预约。');
+    throw new PreparationError('日程标题须为 1 到 500 字，尚未预约。');
   }
   if (typeof description !== 'string' || new TextEncoder().encode(description).length > 8000 || description.includes('\0')) {
-    throw new Error('日程说明不得超过 8000 字节，尚未预约。');
+    throw new PreparationError('日程说明不得超过 8000 字节，尚未预约。');
   }
   const startMs = timestamp(start);
   const endMs = timestamp(end);
   if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || Math.floor(endMs/1000) <= Math.floor(startMs/1000) || endMs-startMs > 86_400_000) {
-    throw new Error('日程起止时间无效，尚未预约。');
+    throw new PreparationError('日程起止时间无效，尚未预约。');
   }
   const participants = [...new Set(plan.participantIds)].sort();
-  if (participants.some(id => !/^ou_[A-Za-z0-9_]{1,125}$/.test(id))) throw new Error('日程参与人无效，尚未预约。');
+  if (participants.some(id => !/^ou_[A-Za-z0-9_]{1,125}$/.test(id))) throw new PreparationError('日程参与人无效，尚未预约。');
 
   const key = operationId.toLowerCase();
   const run = (args:string[], stage:string) => cli([...args,'--as','user','--format','json'],`${key}:${stage}`);
@@ -76,17 +77,17 @@ export async function createCalendar(cli: Cli, plan: CalendarCreatePlan, operati
     calendar && (calendar.role === 'owner' || calendar.role === 'writer') && calendar.is_deleted !== true && calendar.is_third_party !== true,
   );
   const calendarId = eligible[0]?.calendar_id;
-  if (eligible.length !== 1 || !identifier(calendarId)) throw new Error('未取得唯一可写主日历，尚未预约。');
+  if (eligible.length !== 1 || !identifier(calendarId)) throw new PreparationError('未取得唯一可写主日历，尚未预约。');
 
   if (!allowConflict) {
     for (const [index, user_id] of participants.entries()) {
       const data = JSON.stringify({time_min:start,time_max:end,user_id,only_busy:true});
       const busy = record(await run(['calendar','freebusys','list','--user-id-type','open_id','--data',data],`busy:${index}`));
       if (!Array.isArray(busy?.freebusy_list)) {
-        throw new Error('飞书忙闲响应格式无效，尚未预约。');
+        throw new PreparationError('飞书忙闲响应格式无效，尚未预约。');
       }
       if (busy.freebusy_list.length) {
-        throw new Error('该时段有参与人已有日程，尚未预约。');
+        throw new PreparationError('该时段有参与人已有日程，尚未预约。');
       }
     }
   }

@@ -119,3 +119,69 @@ it('checks only the selected recipient when confirming a cached draft',async()=>
 it.each([undefined,{id:'ou_bing',name:'小冰',aliases:[],kind:'person',active:false,external:false},{id:'ou_bing',name:'小冰',aliases:[],kind:'person',active:true,external:true}])('rejects unavailable selected recipients without sending',async recipient=>{
  const {workflow,cli}=setup(vi.fn().mockResolvedValue(recipient));const draft=await workflow.prepare('发消息','');await expect(workflow.confirm(draft.id)).rejects.toThrow('消息对象已不可用');expect(cli).not.toHaveBeenCalled();
 });
+
+it('marks all pre-send failures in confirm as message_not_submitted without calling cli', async () => {
+  const unavailable = setup(vi.fn().mockResolvedValue(undefined));
+  const d1 = await unavailable.workflow.prepare('发消息', '');
+  await expect(unavailable.workflow.confirm(d1.id)).rejects.toMatchObject({ code: 'message_not_submitted' });
+  expect(unavailable.cli).not.toHaveBeenCalled();
+
+  const switched = setup();
+  const d2 = await switched.workflow.prepare('发消息', '');
+  switched.readAccount.mockResolvedValue({ accountId: 'ou_other', scopes: ['im:message.send_as_user'] });
+  await expect(switched.workflow.confirm(d2.id)).rejects.toMatchObject({ code: 'message_not_submitted' });
+  expect(switched.cli).not.toHaveBeenCalled();
+
+  const lookupError = setup(vi.fn().mockRejectedValue(new Error('raw transport failure')));
+  const d3 = await lookupError.workflow.prepare('发消息', '');
+  await expect(lookupError.workflow.confirm(d3.id)).rejects.toMatchObject({ code: 'message_not_submitted' });
+  expect(lookupError.cli).not.toHaveBeenCalled();
+
+  const cli = vi.fn();
+  let row: MessageDraft | undefined;
+  const writeFail = createMessageWorkflow({
+    cli,
+    readAccount: async () => ({ accountId: 'ou_me', scopes: ['im:message.send_as_user'] }),
+    readRecipients: async () => [{ id: 'ou_bing', name: '小冰', aliases: [], kind: 'person', active: true, external: false }],
+    model: async () => ({ action: 'send', recipientId: 'ou_bing', content: '好' }),
+    store: { read: async () => row, write: async d => { if (d.status === 'sending') throw Error('disk'); row = structuredClone(d); } },
+  });
+  const d4 = await writeFail.prepare('发消息', '');
+  await expect(writeFail.confirm(d4.id)).rejects.toMatchObject({ code: 'message_not_submitted' });
+  expect(cli).not.toHaveBeenCalled();
+});
+
+it('enriches clarify candidates via searchRecipients and tolerates search failures', async () => {
+  const rows = new Map<string, MessageDraft>();
+  const model = vi.fn()
+    .mockResolvedValueOnce({ action: 'clarify', recipientQuery: '聪聪', content: '今天把SOP发给你' })
+    .mockResolvedValueOnce({ action: 'send', recipientId: 'ou_cong', content: '今天把SOP发给你' });
+  const searchRecipients = vi.fn().mockResolvedValue([
+    { id: 'ou_cong', name: '张聪聪', aliases: [], kind: 'person' as const, active: true, external: false },
+  ]);
+  const workflow = createMessageWorkflow({
+    cli: vi.fn(),
+    readAccount: async () => ({ accountId: 'ou_me', scopes: ['im:message.send_as_user'] }),
+    readRecipients: async () => [{ id: 'ou_bing', name: '小冰', aliases: [], kind: 'person', active: true, external: false }],
+    searchRecipients,
+    model,
+    store: { read: async id => rows.get(id), write: async d => { rows.set(d.id, structuredClone(d)); } },
+  });
+  const draft = await workflow.prepare('给聪聪发消息今天把SOP发给他', '');
+  expect(searchRecipients).toHaveBeenCalledWith('聪聪');
+  expect(draft.awaitingRecipient).toBeFalsy();
+  expect(draft.recipient).toMatchObject({ id: 'ou_cong', name: '张聪聪' });
+
+  const failingModel = vi.fn().mockResolvedValueOnce({ action: 'clarify', recipientQuery: '聪聪', content: '你好' });
+  const fallbackWorkflow = createMessageWorkflow({
+    cli: vi.fn(),
+    readAccount: async () => ({ accountId: 'ou_me', scopes: ['im:message.send_as_user'] }),
+    readRecipients: async () => [{ id: 'ou_bing', name: '小冰', aliases: [], kind: 'person', active: true, external: false }],
+    searchRecipients: vi.fn().mockRejectedValue(Error('search rate limited')),
+    model: failingModel,
+    store: { read: async id => rows.get(id), write: async d => { rows.set(d.id, structuredClone(d)); } },
+  });
+  const clarifyDraft = await fallbackWorkflow.prepare('给聪聪发消息你好', '');
+  expect(clarifyDraft.awaitingRecipient).toBe(true);
+  expect(clarifyDraft.content).toBe('你好');
+});

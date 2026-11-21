@@ -60,15 +60,20 @@ export function FeishuConnectionSettings({
   const busy = pending !== null;
   useEffect(() => {
     let active = true;
-    void experimentsRequest<CliStatus>({ action: "feishuPluginCliStatus" })
-      .then((value) => {
-        if (active) setCli(value);
-      })
-      .catch((error) => {
-        if (active) setError(String(error));
-      });
+    const loadCli = () => {
+      void experimentsRequest<CliStatus>({ action: "feishuPluginCliStatus" })
+        .then((value) => {
+          if (active) setCli(value);
+        })
+        .catch((error) => {
+          if (active) setError(String(error));
+        });
+    };
+    loadCli();
+    window.addEventListener("feishu-cli-state-changed", loadCli);
     return () => {
       active = false;
+      window.removeEventListener("feishu-cli-state-changed", loadCli);
     };
   }, []);
   useEffect(() => {
